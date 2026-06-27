@@ -1,4 +1,3 @@
-import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import { toast } from "sonner";
 
 export type AITask = {
@@ -9,85 +8,7 @@ export type AITask = {
   scheduledTime?: string;
 };
 
-const API_KEY_STORAGE = "priora:gemini-key";
-const LEGACY_KEY_STORAGE = "nagrikos:gemini-key";
-
-export function getApiKey(): string | null {
-  if (typeof window === "undefined") return null;
-  return (
-    window.localStorage.getItem(API_KEY_STORAGE) ?? window.localStorage.getItem(LEGACY_KEY_STORAGE)
-  );
-}
-
-export function setApiKey(key: string) {
-  window.localStorage.setItem(API_KEY_STORAGE, key);
-}
-
-export function clearApiKey() {
-  window.localStorage.removeItem(API_KEY_STORAGE);
-  window.localStorage.removeItem(LEGACY_KEY_STORAGE);
-}
-
-const MOCK_FALLBACK: AITask[] = [
-  {
-    title: "Submit design campaign deliverables",
-    urgencyScore: 10,
-    estimatedMinutes: 90,
-    energyLevel: "High",
-  },
-  {
-    title: "Pay internet bill before midnight",
-    urgencyScore: 9,
-    estimatedMinutes: 10,
-    energyLevel: "Low",
-  },
-  {
-    title: "Email professor about quiz clarification",
-    urgencyScore: 7,
-    estimatedMinutes: 15,
-    energyLevel: "Low",
-  },
-  {
-    title: "Draft social post for product launch",
-    urgencyScore: 6,
-    estimatedMinutes: 30,
-    energyLevel: "Medium",
-  },
-  {
-    title: "Review college quiz material for Friday",
-    urgencyScore: 5,
-    estimatedMinutes: 60,
-    energyLevel: "Medium",
-  },
-  {
-    title: "Plan tomorrow's deep-work block",
-    urgencyScore: 3,
-    estimatedMinutes: 15,
-    energyLevel: "Low",
-  },
-];
-
-const schema = {
-  type: SchemaType.ARRAY,
-  items: {
-    type: SchemaType.OBJECT,
-    properties: {
-      title: { type: SchemaType.STRING, description: "Cleaned-up task name" },
-      urgencyScore: { type: SchemaType.NUMBER, description: "Urgency from 1-10" },
-      estimatedMinutes: { type: SchemaType.NUMBER, description: "Estimated minutes to complete" },
-      energyLevel: { type: SchemaType.STRING, description: "High, Medium, or Low" },
-      scheduledTime: {
-        type: SchemaType.STRING,
-        description: "Explicit requested start time in 24-hour HH:MM format, or empty if none",
-      },
-    },
-    required: ["title", "urgencyScore", "estimatedMinutes", "energyLevel"],
-  },
-};
-
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-const GEMINI_MODELS = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"];
 
 function isStatus(err: unknown, code: number): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -125,31 +46,21 @@ async function generateWithFallback(
   prompt: string,
   opts: { json?: boolean } = {},
 ): Promise<string> {
-  const key = getApiKey();
-  if (!key) throw new Error("Missing Gemini API key. Add it in Settings.");
-  const genAI = new GoogleGenerativeAI(key);
+  const response = await fetch("/api/gemini", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt, json: !!opts.json }),
+  });
 
-  let lastError: unknown;
-  for (const modelName of GEMINI_MODELS) {
-    try {
-      const model = genAI.getGenerativeModel({
-        model: modelName,
-        generationConfig: opts.json
-          ? ({ responseMimeType: "application/json", responseSchema: schema } as never)
-          : {},
-      });
-      const res = await model.generateContent(prompt);
-      return res.response.text();
-    } catch (err) {
-      lastError = err;
-      if (!isModelUnavailable(err)) throw err;
-    }
+  const payload = (await response.json().catch(() => null)) as {
+    text?: string;
+    error?: string;
+  } | null;
+  if (!response.ok) {
+    throw new Error(payload?.error ?? "Gemini request failed.");
   }
-
-  throw new Error(
-    "Gemini model access failed. Open Settings, confirm your API key is valid, then try again.",
-    { cause: lastError },
-  );
+  if (!payload?.text) throw new Error("Gemini returned an empty response.");
+  return payload.text;
 }
 
 async function callGeminiTasks(brainDump: string): Promise<AITask[]> {
@@ -189,7 +100,6 @@ Return ONLY a JSON array of objects with keys: title, urgencyScore, estimatedMin
 }
 
 export async function prioritizeBrainDump(brainDump: string): Promise<AITask[]> {
-  if (!getApiKey()) throw new Error("Missing Gemini API key. Add it in Settings.");
   try {
     return await callGeminiTasks(brainDump);
   } catch (err) {
@@ -202,11 +112,7 @@ export async function prioritizeBrainDump(brainDump: string): Promise<AITask[]> 
       return await callGeminiTasks(brainDump);
     } catch (retryErr) {
       if (!is503(retryErr)) throw retryErr;
-      toast.warning("Showing demo priorities", {
-        description:
-          "Gemini is still overloaded. Loaded a sample prioritized list so you can keep exploring.",
-      });
-      return [...MOCK_FALLBACK].sort((a, b) => b.urgencyScore - a.urgencyScore);
+      throw retryErr;
     }
   }
 }

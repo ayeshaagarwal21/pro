@@ -12,4 +12,17 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  nitro: {
+    cloudflare: {
+      wrangler: {
+        d1_databases: [
+          {
+            binding: "priora_db",
+            database_name: "priora-db",
+            database_id: "1529b87c-3e48-491a-bcfd-d5d2a33b1347",
+          },
+        ],
+      },
+    },
+  },
 });

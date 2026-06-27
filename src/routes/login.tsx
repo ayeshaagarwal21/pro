@@ -38,7 +38,6 @@ function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [remember, setRemember] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -82,21 +81,13 @@ function LoginPage() {
       if (mode === "register") {
         await registerUser({ name, email, password });
         toast.success("Account created", {
-          description: "Now login with the same email and password.",
+          description: "Your private workspace is ready.",
         });
-        setMode("login");
-        setPassword("");
-        setConfirmPassword("");
+        void navigate({ to: "/" });
         return;
       }
 
       await loginUser(email, password);
-      if (remember) {
-        window.localStorage.setItem("priora-user-email", email.trim().toLowerCase());
-      } else {
-        window.localStorage.removeItem("priora-user-email");
-      }
-
       toast.success("Welcome back", {
         description: "Your focus flow is ready.",
       });
@@ -267,16 +258,6 @@ function LoginPage() {
                     </div>
                   </div>
                 )}
-
-                <label className="flex items-center gap-3 text-sm text-muted-foreground">
-                  <input
-                    type="checkbox"
-                    checked={remember}
-                    onChange={(event) => setRemember(event.target.checked)}
-                    className="size-4 rounded border-white/20 bg-white/10 accent-rasa-violet"
-                  />
-                  Remember me on this device
-                </label>
 
                 {error && (
                   <div className="rounded-xl border border-rasa-rose/25 bg-rasa-rose/10 px-3 py-2 text-sm text-rasa-rose">

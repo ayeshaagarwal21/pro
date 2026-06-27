@@ -25,7 +25,6 @@ import {
   Target,
   ArrowUpRight,
   Loader2,
-  KeyRound,
   AlertCircle,
   AlarmClock,
   Copy,
@@ -44,13 +43,18 @@ import {
 } from "@/components/ui/dialog";
 import {
   prioritizeBrainDump,
-  getApiKey,
-  setApiKey,
   autoExecuteTask,
   suggestRescheduleSlot,
   type AITask,
 } from "@/lib/gemini";
 import { getCurrentUser, logoutUser, type PrioraUser } from "@/lib/auth";
+import {
+  createTasks,
+  listTasks,
+  updateTask,
+  type CreateTaskInput,
+  type StoredTaskRecord,
+} from "@/lib/tasks";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/")({
@@ -81,12 +85,15 @@ type Task = {
   accent: "rose" | "gold" | "jade" | "violet" | "amber";
   executable?: { kind: "email" | "post" | "plan"; subject?: string; body: string };
   icon: typeof Mail;
+  iconKey: StoredTaskRecord["iconKey"];
   scheduledAt: Date;
+  createdAt: Date;
+  completedAt?: Date;
   completed?: boolean;
   notified10?: boolean;
 };
 
-type TaskDraft = Omit<Task, "scheduledAt"> & {
+type TaskDraft = Omit<Task, "scheduledAt" | "createdAt" | "completedAt"> & {
   preferredTime?: string;
 };
 
@@ -102,13 +109,12 @@ type TimelineSlot = {
   end: Date;
 };
 
-const todayAt = (h: number, m = 0) => {
-  const d = new Date();
-  d.setHours(h, m, 0, 0);
-  return d;
+type AvailabilityBlock = {
+  start: string;
+  end: string;
 };
 
-const RAW_TASKS: Omit<Task, "scheduledAt">[] = [
+/* Removed the old demo seed tasks so every account starts from saved user data.
   {
     id: "t1",
     title: "Submit B.Tech Project Logic",
@@ -188,8 +194,7 @@ const RAW_TASKS: Omit<Task, "scheduledAt">[] = [
     accent: "violet",
     icon: BarChart3,
   },
-];
-
+*/
 function fmt(d: Date): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
@@ -272,6 +277,22 @@ const accentMap = {
 
 const ACCENTS: Task["accent"][] = ["rose", "gold", "jade", "violet", "amber"];
 const ICONS = [FileText, Mail, Wand2, CreditCard, BarChart3, Calendar];
+const ICON_BY_KEY: Record<StoredTaskRecord["iconKey"], typeof Mail> = {
+  file: FileText,
+  mail: Mail,
+  wand: Wand2,
+  card: CreditCard,
+  chart: BarChart3,
+  calendar: Calendar,
+};
+const ICON_KEY_BY_COMPONENT = new Map<typeof Mail, StoredTaskRecord["iconKey"]>([
+  [FileText, "file"],
+  [Mail, "mail"],
+  [Wand2, "wand"],
+  [CreditCard, "card"],
+  [BarChart3, "chart"],
+  [Calendar, "calendar"],
+]);
 
 function parseTimeHint(text: string): string | null {
   const amPm = /\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b/i.exec(text);
@@ -309,6 +330,74 @@ function dateForPreferredTime(time: string, startFrom: Date, minutes: number): D
   return d;
 }
 
+function minutesOfDay(date: Date): number {
+  return date.getHours() * 60 + date.getMinutes();
+}
+
+function timeToMinutes(time: string): number {
+  const [h, m] = time.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function formatBlock(block: AvailabilityBlock): string {
+  return `${timeLabel(block.start)}-${timeLabel(block.end)}`;
+}
+
+function overlapsUnavailable(start: Date, minutes: number, blocks: AvailabilityBlock[]): boolean {
+  const slotStart = minutesOfDay(start);
+  const slotEnd = slotStart + minutes;
+  return blocks.some((block) => {
+    const blockStart = timeToMinutes(block.start);
+    const blockEnd = timeToMinutes(block.end);
+    if (blockEnd <= blockStart) return false;
+    return slotStart < blockEnd && slotEnd > blockStart;
+  });
+}
+
+function overlapsOccupied(start: Date, minutes: number, occupied: Date[]): boolean {
+  const slotEnd = start.getTime() + minutes * 60_000;
+  return occupied.some((occupiedStart) => {
+    const occupiedEnd = occupiedStart.getTime() + 60 * 60_000;
+    return start.getTime() < occupiedEnd && slotEnd > occupiedStart.getTime();
+  });
+}
+
+function findNextAvailableSlot(
+  startFrom: Date,
+  minutes: number,
+  occupied: Date[],
+  unavailable: AvailabilityBlock[],
+): Date {
+  const candidate = new Date(startFrom);
+  candidate.setSeconds(0, 0);
+  const rounded = Math.ceil(candidate.getMinutes() / 15) * 15;
+  candidate.setMinutes(rounded);
+
+  for (let attempts = 0; attempts < 7 * 24 * 4; attempts++) {
+    const hour = candidate.getHours();
+    const dayEnd = new Date(candidate);
+    dayEnd.setHours(21, 0, 0, 0);
+    if (hour < 9) candidate.setHours(9, 0, 0, 0);
+    if (candidate.getTime() + minutes * 60_000 > dayEnd.getTime()) {
+      candidate.setDate(candidate.getDate() + 1);
+      candidate.setHours(9, 0, 0, 0);
+      continue;
+    }
+    if (
+      !overlapsOccupied(candidate, minutes, occupied) &&
+      !overlapsUnavailable(candidate, minutes, unavailable)
+    ) {
+      return new Date(candidate);
+    }
+    candidate.setMinutes(candidate.getMinutes() + 15);
+  }
+
+  const tomorrow = new Date(startFrom);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  tomorrow.setHours(9, 0, 0, 0);
+  return tomorrow;
+}
+
 function aiTaskToTask(t: AITask, i: number, sourceText?: string): TaskDraft {
   const lower = t.title.toLowerCase();
   const isEmail = /email|reply|respond|message/.test(lower);
@@ -331,6 +420,11 @@ function aiTaskToTask(t: AITask, i: number, sourceText?: string): TaskDraft {
           : "Soon",
     accent: ACCENTS[i % ACCENTS.length],
     icon: isEmail ? Mail : isPost ? FileText : ICONS[i % ICONS.length],
+    iconKey: isEmail
+      ? "mail"
+      : isPost
+        ? "file"
+        : (ICON_KEY_BY_COMPONENT.get(ICONS[i % ICONS.length]) ?? "file"),
     preferredTime,
     executable: isEmail
       ? {
@@ -363,7 +457,56 @@ function withSchedule(raw: TaskDraft[], startFrom: Date, occupied: Date[] = []):
   return raw.map(({ preferredTime, ...t }) => ({
     ...t,
     scheduledAt: explicit.get(t.id) ?? scheduled.get(t.id) ?? startFrom,
+    createdAt: new Date(),
   }));
+}
+
+function normalizeTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function toCreateTask(task: Task): CreateTaskInput {
+  return {
+    title: task.title,
+    description: task.context,
+    status: task.completed ? "completed" : "active",
+    priority: task.score,
+    dueDate: task.scheduledAt.toISOString(),
+    score: task.score,
+    minutes: task.minutes,
+    energy: task.energy,
+    due: task.due,
+    accent: task.accent,
+    executable: task.executable,
+    iconKey: task.iconKey,
+    scheduledAt: task.scheduledAt.toISOString(),
+    notified10: task.notified10,
+    completedAt: task.completedAt?.toISOString(),
+  };
+}
+
+function fromStoredTask(record: StoredTaskRecord): Task {
+  return {
+    id: record.id,
+    title: record.title,
+    context: record.description,
+    score: record.score,
+    minutes: record.minutes,
+    energy: record.energy,
+    due: record.due,
+    accent: record.accent,
+    executable: record.executable,
+    iconKey: record.iconKey,
+    icon: ICON_BY_KEY[record.iconKey] ?? FileText,
+    scheduledAt: new Date(record.scheduledAt),
+    createdAt: new Date(record.createdAt),
+    completedAt: record.completedAt ? new Date(record.completedAt) : undefined,
+    completed: record.status === "completed",
+    notified10: record.notified10,
+  };
 }
 
 /* ---------------- ICS export ---------------- */
@@ -596,6 +739,10 @@ function Index() {
   const [completingId, setCompletingId] = useState<string | null>(null);
   const [now, setNow] = useState(new Date());
   const [notifOpen, setNotifOpen] = useState(false);
+  const [availabilityTaskId, setAvailabilityTaskId] = useState<string | null>(null);
+  const [availabilityPromptedIds, setAvailabilityPromptedIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [notifications, setNotifications] = useState<
     { id: string; title: string; body: string; unread: boolean }[]
   >([
@@ -614,14 +761,45 @@ function Index() {
   ]);
   const unreadCount = notifications.filter((n) => n.unread).length;
 
-  const [tasks, setTasks] = useState<Task[]>(() => withSchedule(RAW_TASKS, new Date()));
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [tasksLoaded, setTasksLoaded] = useState(false);
   const [aiPowered, setAiPowered] = useState(false);
-  const [currentUser, setCurrentUser] = useState<PrioraUser | null>(() => getCurrentUser());
+  const [currentUser, setCurrentUser] = useState<PrioraUser | null>(null);
+  const reminderInFlightRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    const user = getCurrentUser();
-    setCurrentUser(user);
-    if (!user) void navigate({ to: "/login" });
+    let cancelled = false;
+    setTasksLoaded(false);
+    getCurrentUser()
+      .then(async (user) => {
+        if (cancelled) return;
+        if (!user) {
+          setCurrentUser(null);
+          setTasks([]);
+          void navigate({ to: "/login" });
+          return;
+        }
+        setCurrentUser(user);
+        const records = await listTasks();
+        if (cancelled) return;
+        const savedTasks = records.map(fromStoredTask);
+        setTasks(savedTasks);
+        setAiPowered(savedTasks.length > 0);
+      })
+      .catch((error) => {
+        console.error(error);
+        toast.error("Couldn't restore your session", {
+          description: "Please log in again.",
+        });
+        void navigate({ to: "/login" });
+      })
+      .finally(() => {
+        if (!cancelled) setTasksLoaded(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [navigate]);
 
   const displayName = currentUser?.name || "User";
@@ -641,35 +819,67 @@ function Index() {
     return () => clearInterval(id);
   }, []);
 
-  /* Notification scan: 10 min before scheduled start */
+  /* Reminder scan: ping once inside the final 10 minutes before a scheduled task. */
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    if (!tasksLoaded) return;
 
-    setTasks((prev) => {
-      let mutated = false;
-      const next = prev.map((t) => {
-        if (t.completed || t.notified10) return t;
-        const diff = (t.scheduledAt.getTime() - now.getTime()) / 60_000;
-        if (diff > 9 && diff <= 10) {
-          try {
-            new Notification(`⚡ ${t.title}`, {
-              body: `Starts in 10 minutes · ${t.energy} energy · ${t.minutes} min`,
-              icon: "/favicon.ico",
-              tag: t.id,
-            });
-            playChime();
-          } catch {
-            /* ignore */
-          }
-          mutated = true;
-          return { ...t, notified10: true };
-        }
-        return t;
-      });
-      return mutated ? next : prev;
+    const dueSoon = tasks.filter((task) => {
+      if (task.completed || task.notified10 || reminderInFlightRef.current.has(task.id)) {
+        return false;
+      }
+      const diff = (task.scheduledAt.getTime() - now.getTime()) / 60_000;
+      return diff > 0 && diff <= 10;
     });
-  }, [now]);
+
+    for (const task of dueSoon) {
+      reminderInFlightRef.current.add(task.id);
+      setTasks((prev) =>
+        prev.map((item) => (item.id === task.id ? { ...item, notified10: true } : item)),
+      );
+      setNotifications((prev) => [
+        {
+          id: `reminder-${task.id}-${Date.now()}`,
+          title: `${task.title} starts soon`,
+          body: `${task.minutes} min · ${task.energy} energy · ${task.scheduledAt.toLocaleTimeString(
+            undefined,
+            {
+              hour: "2-digit",
+              minute: "2-digit",
+            },
+          )}`,
+          unread: true,
+        },
+        ...prev,
+      ]);
+      toast("Task starts soon", {
+        description: `${task.title} starts within 10 minutes.`,
+      });
+      playChime();
+
+      if ("Notification" in window && Notification.permission === "granted") {
+        try {
+          new Notification(`Priora reminder: ${task.title}`, {
+            body: `Starts within 10 minutes · ${task.energy} energy · ${task.minutes} min`,
+            icon: "/favicon.ico",
+            tag: task.id,
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+
+      updateTask(task.id, { notified10: true }).catch((error) => {
+        reminderInFlightRef.current.delete(task.id);
+        setTasks((prev) =>
+          prev.map((item) => (item.id === task.id ? { ...item, notified10: false } : item)),
+        );
+        toast.error("Couldn't save reminder state", {
+          description: error instanceof Error ? error.message : "Database update failed.",
+        });
+      });
+    }
+  }, [now, tasks, tasksLoaded]);
 
   const overdueTasks = useMemo(
     () =>
@@ -678,6 +888,19 @@ function Index() {
       ),
     [tasks, now],
   );
+
+  useEffect(() => {
+    if (!tasksLoaded || availabilityTaskId || !overdueTasks.length) return;
+    const next = overdueTasks.find((task) => !availabilityPromptedIds.has(task.id));
+    if (!next) return;
+
+    setAvailabilityPromptedIds((prev) => new Set(prev).add(next.id));
+    setAvailabilityTaskId(next.id);
+    toast("Task time is up", {
+      description: "Tell Priora when you are unavailable before it reschedules.",
+    });
+  }, [availabilityPromptedIds, availabilityTaskId, overdueTasks, tasksLoaded]);
+
   const activeTasks = useMemo(
     () =>
       tasks
@@ -685,8 +908,27 @@ function Index() {
         .sort((a, b) => b.score - a.score),
     [tasks, overdueTasks],
   );
+  const todayTaskCount = tasks.filter(
+    (task) => task.createdAt.toDateString() === now.toDateString(),
+  ).length;
+  const completedTodayCount = tasks.filter(
+    (task) => task.completedAt?.toDateString() === now.toDateString(),
+  ).length;
+  const totalCompletedCount = tasks.filter((task) => task.completed).length;
+  const aiConfidence = activeTasks.length
+    ? Math.round(activeTasks.reduce((sum, task) => sum + task.score, 0) / activeTasks.length)
+    : 0;
+  const scheduledMinutes = activeTasks.reduce((sum, task) => sum + task.minutes, 0);
+  const calmScore = Math.max(
+    1,
+    Math.min(
+      10,
+      10 - overdueTasks.length * 1.5 - activeTasks.filter((task) => task.score >= 85).length * 0.4,
+    ),
+  );
 
   const focus = activeTasks[0];
+  const availabilityTask = tasks.find((task) => task.id === availabilityTaskId) ?? null;
 
   const timeline = useMemo<TimelineSlot[]>(
     () =>
@@ -718,24 +960,47 @@ function Index() {
     return "Good evening";
   }, [now]);
 
-  const handlePrioritized = (results: AITask[], sourceText?: string) => {
+  const handlePrioritized = async (results: AITask[], sourceText?: string) => {
     const now = new Date();
-    const raw = results.map((task, index) =>
-      aiTaskToTask(task, index, results.length === 1 ? sourceText : undefined),
+    const existingTitles = new Set(
+      tasks.filter((task) => !task.completed).map((task) => normalizeTitle(task.title)),
     );
-    setTasks((prev) => [
-      ...prev,
-      ...withSchedule(
-        raw,
-        now,
-        prev.filter((task) => !task.completed).map((task) => task.scheduledAt),
-      ),
-    ]);
+    const raw = results
+      .map((task, index) =>
+        aiTaskToTask(task, index, results.length === 1 ? sourceText : undefined),
+      )
+      .filter((task) => {
+        const key = normalizeTitle(task.title);
+        if (!key || existingTitles.has(key)) return false;
+        existingTitles.add(key);
+        return true;
+      });
+    if (!raw.length) {
+      setBrainOpen(false);
+      toast("No duplicate tasks added", {
+        description: "Those tasks are already in your active plan.",
+      });
+      return;
+    }
+    const scheduled = withSchedule(
+      raw,
+      now,
+      tasks.filter((task) => !task.completed).map((task) => task.scheduledAt),
+    );
+    try {
+      const saved = await createTasks(scheduled.map(toCreateTask));
+      setTasks((prev) => [...prev, ...saved.map(fromStoredTask)]);
+    } catch (error) {
+      toast.error("Couldn't save tasks", {
+        description: error instanceof Error ? error.message : "Database write failed.",
+      });
+      return;
+    }
     setAiPowered(true);
     setBrainOpen(false);
     setHighlightedId(null);
     toast.success("Priora prioritized your day", {
-      description: `${raw.length} new ${raw.length === 1 ? "task" : "tasks"} added to your existing plan.`,
+      description: `${raw.length} new ${raw.length === 1 ? "task" : "tasks"} saved to your database.`,
     });
   };
 
@@ -752,52 +1017,81 @@ function Index() {
   const handleComplete = useCallback((id: string) => {
     setCompletingId(id);
     window.setTimeout(() => {
-      setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, completed: true } : t)));
-      setCompletingId(null);
-      toast.success("Task completed! +10 XP", {
-        description: "Nice momentum — Priora updated your streak.",
-      });
+      const completedAt = new Date();
+      updateTask(id, {
+        status: "completed",
+        completedAt: completedAt.toISOString(),
+      })
+        .then((saved) => {
+          setTasks((prev) => prev.map((t) => (t.id === id ? fromStoredTask(saved) : t)));
+          toast.success("Task completed! +10 XP", {
+            description: "Nice momentum - Priora updated your streak.",
+          });
+        })
+        .catch((error) => {
+          toast.error("Couldn't mark task complete", {
+            description: error instanceof Error ? error.message : "Database update failed.",
+          });
+        })
+        .finally(() => setCompletingId(null));
     }, 450);
   }, []);
 
   const handleReschedule = useCallback(
-    async (id: string) => {
+    async (id: string, unavailable: AvailabilityBlock[] = []) => {
       const t = tasks.find((x) => x.id === id);
       if (!t) return;
       toast("Asking Gemini for the next open slot…", { description: t.title });
-      const occupied = activeTasks.filter((x) => x.id !== id).map((x) => fmt(x.scheduledAt));
+      const occupiedTasks = activeTasks.filter((x) => x.id !== id);
+      const occupiedDates = occupiedTasks.map((x) => x.scheduledAt);
+      const occupied = [
+        ...occupiedTasks.map((x) => fmt(x.scheduledAt)),
+        ...unavailable.map(formatBlock),
+      ];
 
       let newDate: Date | null = null;
-      if (getApiKey()) {
-        try {
-          const { time } = await suggestRescheduleSlot(t.title, occupied);
-          const [hh, mm] = time.split(":").map(Number);
-          const d = new Date();
-          if (d.getHours() * 60 + d.getMinutes() >= hh * 60 + mm) d.setDate(d.getDate() + 1);
-          d.setHours(hh, mm, 0, 0);
-          newDate = d;
-        } catch {
-          /* fall through */
-        }
+      try {
+        const { time } = await suggestRescheduleSlot(t.title, occupied);
+        const [hh, mm] = time.split(":").map(Number);
+        const d = new Date();
+        if (d.getHours() * 60 + d.getMinutes() >= hh * 60 + mm) d.setDate(d.getDate() + 1);
+        d.setHours(hh, mm, 0, 0);
+        newDate = d;
+      } catch {
+        /* fall through */
       }
-      if (!newDate) {
-        // algorithmic fallback: next free hour from now
-        const map = autoSchedule(
-          [{ id: t.id, minutes: t.minutes, score: 999 }],
-          new Date(),
-          activeTasks.filter((x) => x.id !== id).map((x) => x.scheduledAt),
-        );
-        newDate = map.get(t.id) ?? new Date();
+      if (
+        !newDate ||
+        overlapsUnavailable(newDate, t.minutes, unavailable) ||
+        overlapsOccupied(newDate, t.minutes, occupiedDates)
+      ) {
+        newDate = findNextAvailableSlot(new Date(), t.minutes, occupiedDates, unavailable);
       }
-      setTasks((prev) =>
-        prev.map((x) => (x.id === id ? { ...x, scheduledAt: newDate!, notified10: false } : x)),
-      );
+      try {
+        const saved = await updateTask(id, {
+          dueDate: newDate.toISOString(),
+          scheduledAt: newDate.toISOString(),
+          notified10: false,
+        });
+        setTasks((prev) => prev.map((x) => (x.id === id ? fromStoredTask(saved) : x)));
+      } catch (error) {
+        toast.error("Couldn't reschedule task", {
+          description: error instanceof Error ? error.message : "Database update failed.",
+        });
+        return;
+      }
       toast.success("Rescheduled", {
         description: `${t.title} → ${newDate.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" })}`,
       });
     },
     [tasks, activeTasks],
   );
+
+  const handleAvailabilitySubmit = async (blocks: AvailabilityBlock[]) => {
+    if (!availabilityTaskId) return;
+    await handleReschedule(availabilityTaskId, blocks);
+    setAvailabilityTaskId(null);
+  };
 
   const handleExportIcs = () => {
     const list = activeTasks.length ? activeTasks : tasks.filter((t) => !t.completed);
@@ -823,11 +1117,15 @@ function Index() {
     });
   };
 
-  const handleLogout = () => {
-    logoutUser();
-    setCurrentUser(null);
-    toast("Signed out", { description: "Login again with your registered credentials." });
-    void navigate({ to: "/login" });
+  const handleLogout = async () => {
+    try {
+      await logoutUser();
+    } finally {
+      setCurrentUser(null);
+      setTasks([]);
+      toast("Signed out", { description: "Login again with your registered credentials." });
+      void navigate({ to: "/login" });
+    }
   };
 
   const handleRequestNotifications = async () => {
@@ -860,6 +1158,16 @@ function Index() {
     }
   };
 
+  if (!tasksLoaded) {
+    return (
+      <div className="min-h-screen grid place-items-center text-foreground">
+        <div className="glass-strong rounded-2xl px-5 py-4 text-sm text-muted-foreground">
+          Loading your private workspace...
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen text-foreground">
       <MobileTopBar onMenu={() => setSidebarOpen(true)} initials={initials} />
@@ -868,10 +1176,12 @@ function Index() {
         <Sidebar
           open={sidebarOpen}
           onClose={() => setSidebarOpen(false)}
-          onOpenSettings={() => setSettingsOpen(true)}
           activeNav={activeView}
           user={currentUser}
           onLogout={handleLogout}
+          completedToday={completedTodayCount}
+          todayTotal={todayTaskCount}
+          xp={totalCompletedCount * 10}
           onNav={(label) => {
             if (
               label === "Dashboard" ||
@@ -991,7 +1301,7 @@ function Index() {
           {overdueTasks.length > 0 && activeView !== "Insights" && (
             <RescueSection
               tasks={overdueTasks}
-              onReschedule={handleReschedule}
+              onReschedule={(id) => setAvailabilityTaskId(id)}
               onComplete={handleComplete}
               completingId={completingId}
             />
@@ -1011,7 +1321,13 @@ function Index() {
                 ) : (
                   <EmptyHero onBrainDump={() => setBrainOpen(true)} />
                 )}
-                <StatStrip />
+                <StatStrip
+                  activeTasks={activeTasks}
+                  completedToday={completedTodayCount}
+                  scheduledMinutes={scheduledMinutes}
+                  aiConfidence={aiConfidence}
+                  calmScore={calmScore}
+                />
                 <PriorityList
                   tasks={activeTasks.slice(1)}
                   onExecute={(t) => setActiveTask(t)}
@@ -1058,7 +1374,7 @@ function Index() {
             />
           )}
 
-          {activeView === "Insights" && <InsightsView tasks={tasks} />}
+          {activeView === "Insights" && <InsightsView tasks={tasks} now={now} />}
         </main>
       </div>
 
@@ -1077,14 +1393,20 @@ function Index() {
         onClose={() => setBrainOpen(false)}
         onResult={handlePrioritized}
         onNeedKey={() => {
-          setBrainOpen(false);
-          setSettingsOpen(true);
+          toast.error("Gemini is not configured yet", {
+            description: "Add GEMINI_API_KEY in the backend environment and restart the app.",
+          });
         }}
       />
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         onRequestNotifications={handleRequestNotifications}
+      />
+      <AvailabilityModal
+        task={availabilityTask}
+        onClose={() => setAvailabilityTaskId(null)}
+        onSubmit={handleAvailabilitySubmit}
       />
     </div>
   );
@@ -1094,18 +1416,22 @@ function Index() {
 function Sidebar({
   open,
   onClose,
-  onOpenSettings,
   activeNav,
   user,
   onLogout,
+  completedToday,
+  todayTotal,
+  xp,
   onNav,
 }: {
   open: boolean;
   onClose: () => void;
-  onOpenSettings: () => void;
   activeNav: string;
   user: PrioraUser | null;
   onLogout: () => void;
+  completedToday: number;
+  todayTotal: number;
+  xp: number;
   onNav: (label: string) => void;
 }) {
   const items = [
@@ -1187,13 +1513,20 @@ function Sidebar({
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <Flame className="size-3.5 text-rasa-rose" /> Streak
             </div>
-            <div className="mt-1 text-2xl font-bold">14 days</div>
+            <div className="mt-1 text-2xl font-bold">{completedToday > 0 ? "1 day" : "0 days"}</div>
             <div className="mt-3 h-1.5 rounded-full bg-white/5 overflow-hidden">
-              <div className="h-full w-[68%] bg-[image:var(--gradient-gold)]" />
+              <div
+                className="h-full bg-[image:var(--gradient-gold)]"
+                style={{
+                  width: `${todayTotal ? Math.round((completedToday / todayTotal) * 100) : 0}%`,
+                }}
+              />
             </div>
             <div className="mt-2 flex justify-between text-[11px] text-muted-foreground">
-              <span>4 / 6 done</span>
-              <span className="text-rasa-gold">+120 XP</span>
+              <span>
+                {completedToday} / {todayTotal} done
+              </span>
+              <span className="text-rasa-gold">+{xp} XP</span>
             </div>
           </div>
         </nav>
@@ -1215,12 +1548,6 @@ function Sidebar({
               <LogIn className="size-4" /> Login
             </Link>
           )}
-          <button
-            onClick={onOpenSettings}
-            className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm text-muted-foreground hover:text-foreground hover:bg-white/[0.04] transition"
-          >
-            <Settings className="size-4" /> Settings
-          </button>
         </div>
       </aside>
     </>
@@ -1258,12 +1585,6 @@ function RescueSection({
   onComplete: (id: string) => void;
   completingId: string | null;
 }) {
-  const [busy, setBusy] = useState<string | null>(null);
-  const run = async (id: string) => {
-    setBusy(id);
-    await onReschedule(id);
-    setBusy(null);
-  };
   return (
     <div className="mb-6 rounded-3xl border border-rasa-amber/30 bg-rasa-amber/[0.06] p-5 sm:p-6 backdrop-blur-md">
       <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-rasa-amber">
@@ -1273,7 +1594,7 @@ function RescueSection({
         Priora caught these slipping past their slot.
       </h3>
       <p className="text-xs text-muted-foreground mt-1">
-        Tap Auto-Reschedule to let Gemini drop them into your next open block.
+        Tap Reschedule to tell Priora when you are unavailable before it moves the task.
       </p>
       <ul className="mt-4 space-y-2.5">
         {tasks.map((t) => (
@@ -1297,16 +1618,11 @@ function RescueSection({
             </div>
             <div className="flex items-center gap-2">
               <button
-                onClick={() => run(t.id)}
-                disabled={busy === t.id}
+                onClick={() => onReschedule(t.id)}
                 className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-rasa-amber text-black hover:opacity-90 transition disabled:opacity-60"
               >
-                {busy === t.id ? (
-                  <Loader2 className="size-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="size-3.5" />
-                )}
-                Auto-Reschedule
+                <RefreshCw className="size-3.5" />
+                Reschedule
               </button>
               <button
                 onClick={() => onComplete(t.id)}
@@ -1320,6 +1636,125 @@ function RescueSection({
         ))}
       </ul>
     </div>
+  );
+}
+
+function AvailabilityModal({
+  task,
+  onClose,
+  onSubmit,
+}: {
+  task: Task | null;
+  onClose: () => void;
+  onSubmit: (blocks: AvailabilityBlock[]) => Promise<void>;
+}) {
+  const [start, setStart] = useState(() => fmt(new Date()));
+  const [end, setEnd] = useState(() => {
+    const d = new Date();
+    d.setHours(d.getHours() + 1);
+    return fmt(d);
+  });
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const nextStart = new Date();
+    const nextEnd = new Date();
+    nextEnd.setHours(nextEnd.getHours() + 1);
+    setStart(fmt(nextStart));
+    setEnd(fmt(nextEnd));
+    setError(null);
+  }, [task?.id]);
+
+  const submit = async (blocks: AvailabilityBlock[]) => {
+    setSaving(true);
+    setError(null);
+    try {
+      await onSubmit(blocks);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not reschedule this task.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const submitUnavailable = () => {
+    if (timeToMinutes(end) <= timeToMinutes(start)) {
+      setError("End time must be after start time.");
+      return;
+    }
+    void submit([{ start, end }]);
+  };
+
+  return (
+    <Dialog open={!!task} onOpenChange={(open) => !open && !saving && onClose()}>
+      <DialogContent className="glass-strong border-white/10 sm:max-w-md p-0 overflow-hidden">
+        <div className="relative p-6 pb-4 border-b border-white/5">
+          <div
+            aria-hidden
+            className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-rasa-amber to-transparent"
+          />
+          <DialogHeader>
+            <div className="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-rasa-amber">
+              <AlarmClock className="size-3" /> Time is up
+            </div>
+            <DialogTitle className="text-2xl font-bold mt-2">When are you unavailable?</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              Priora will move {task?.title ? `"${task.title}"` : "this task"} outside that time.
+            </DialogDescription>
+          </DialogHeader>
+        </div>
+
+        <div className="p-6 space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <label className="space-y-2 text-sm font-medium">
+              From
+              <input
+                type="time"
+                value={start}
+                onChange={(event) => setStart(event.target.value)}
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-sm outline-none focus:border-rasa-amber/60"
+              />
+            </label>
+            <label className="space-y-2 text-sm font-medium">
+              Until
+              <input
+                type="time"
+                value={end}
+                onChange={(event) => setEnd(event.target.value)}
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-sm outline-none focus:border-rasa-amber/60"
+              />
+            </label>
+          </div>
+
+          {error && (
+            <div className="rounded-xl border border-rasa-rose/30 bg-rasa-rose/10 px-3 py-2 text-xs text-rasa-rose">
+              {error}
+            </div>
+          )}
+
+          <div className="flex flex-wrap justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => void submit([])}
+              disabled={saving}
+              className="px-4 py-2.5 rounded-xl text-sm bg-white/10 hover:bg-white/15 transition disabled:opacity-60"
+            >
+              I am available now
+            </button>
+            <button
+              type="button"
+              onClick={submitUnavailable}
+              disabled={saving}
+              className="px-5 py-2.5 rounded-xl text-sm font-semibold bg-rasa-amber text-black hover:opacity-90 transition inline-flex items-center gap-2 disabled:opacity-60"
+            >
+              {saving && <Loader2 className="size-4 animate-spin" />}
+              Reschedule
+            </button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -1443,17 +1878,52 @@ function Chip({
 }
 
 /* ---------- Stat strip ---------- */
-function StatStrip() {
+function formatMinutes(total: number): string {
+  const hours = Math.floor(total / 60);
+  const minutes = total % 60;
+  if (!hours) return `${minutes}m`;
+  if (!minutes) return `${hours}h`;
+  return `${hours}h ${minutes}m`;
+}
+
+function StatStrip({
+  activeTasks,
+  completedToday,
+  scheduledMinutes,
+  aiConfidence,
+  calmScore,
+}: {
+  activeTasks: Task[];
+  completedToday: number;
+  scheduledMinutes: number;
+  aiConfidence: number;
+  calmScore: number;
+}) {
   const stats = [
     {
       label: "AI confidence",
-      value: "94%",
-      hint: "Plan accuracy today",
+      value: `${aiConfidence}%`,
+      hint: activeTasks.length ? "Average active priority" : "Add tasks to calculate",
       accent: "violet" as const,
     },
-    { label: "Deep work", value: "2h 45m", hint: "+38m vs avg", accent: "rose" as const },
-    { label: "Focus blocks", value: "3 / 4", hint: "1 left after 4pm", accent: "gold" as const },
-    { label: "Calm score", value: "7.8", hint: "Steady all day", accent: "jade" as const },
+    {
+      label: "Deep work",
+      value: formatMinutes(scheduledMinutes),
+      hint: `${activeTasks.length} active ${activeTasks.length === 1 ? "block" : "blocks"}`,
+      accent: "rose" as const,
+    },
+    {
+      label: "Focus blocks",
+      value: `${completedToday} / ${completedToday + activeTasks.length}`,
+      hint: activeTasks.length ? `${activeTasks.length} still queued` : "Clear for now",
+      accent: "gold" as const,
+    },
+    {
+      label: "Calm score",
+      value: calmScore.toFixed(1),
+      hint: calmScore >= 8 ? "Steady all day" : "Reschedule pressure rising",
+      accent: "jade" as const,
+    },
   ];
   return (
     <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -1813,10 +2283,16 @@ function NotificationsDropdown({
 }
 
 /* ---------- Insights view ---------- */
-function InsightsView({ tasks }: { tasks: Task[] }) {
-  const completed = 12;
-  const focusScore = 85;
-  const queued = tasks.length;
+function InsightsView({ tasks, now }: { tasks: Task[]; now: Date }) {
+  const completed = tasks.filter((task) => task.completed).length;
+  const queued = tasks.filter((task) => !task.completed).length;
+  const activeScores = tasks.filter((task) => !task.completed).map((task) => task.score);
+  const focusScore = activeScores.length
+    ? Math.round(activeScores.reduce((sum, score) => sum + score, 0) / activeScores.length)
+    : 0;
+  const completedToday = tasks.filter(
+    (task) => task.completedAt?.toDateString() === now.toDateString(),
+  ).length;
   return (
     <section className="space-y-6 max-w-4xl">
       <div>
@@ -1831,14 +2307,14 @@ function InsightsView({ tasks }: { tasks: Task[] }) {
             Tasks completed
           </div>
           <div className="mt-2 text-4xl font-bold tabular-nums">{completed}</div>
-          <div className="text-[11px] text-rasa-jade mt-1">+3 vs last week</div>
+          <div className="text-[11px] text-rasa-jade mt-1">{completedToday} completed today</div>
         </div>
         <div className="glass-strong rounded-3xl p-6">
           <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
             Focus score
           </div>
           <div className="mt-2 text-4xl font-bold tabular-nums">{focusScore}%</div>
-          <div className="text-[11px] text-rasa-gold mt-1">Deep work streak: 4 days</div>
+          <div className="text-[11px] text-rasa-gold mt-1">Based on active priorities</div>
         </div>
         <div className="glass-strong rounded-3xl p-6">
           <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
@@ -1964,16 +2440,6 @@ function ExecuteModal({
       return;
     }
     const reqId = ++reqRef.current;
-    if (!getApiKey()) {
-      // Use cached executable body as Markdown if no key
-      const fallback = task.executable
-        ? task.executable.kind === "email"
-          ? `## ${task.executable.subject ?? task.title}\n\n${task.executable.body}`
-          : `## ${task.title}\n\n${task.executable.body}`
-        : `## ${task.title}\n\nAdd your Gemini API key in Settings to generate a tailored AI draft.`;
-      setContent(fallback);
-      return;
-    }
     setLoading(true);
     setError(null);
     setContent("");
@@ -2106,10 +2572,6 @@ function BrainDumpModal({
         setError("Type or speak a few tasks first.");
         return;
       }
-      if (!getApiKey()) {
-        onNeedKey();
-        return;
-      }
       setLoading(true);
       try {
         const tasks = await prioritizeBrainDump(payload);
@@ -2121,7 +2583,12 @@ function BrainDumpModal({
         setText("");
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Something went wrong.";
-        setError(msg.includes("API key") ? "Invalid API key. Check Settings." : msg);
+        if (msg.includes("GEMINI_API_KEY") || msg.includes("not configured")) {
+          onNeedKey();
+          setError("Gemini is not configured on the backend yet.");
+        } else {
+          setError(msg);
+        }
       } finally {
         setLoading(false);
       }
@@ -2298,22 +2765,6 @@ function SettingsModal({
   onClose: () => void;
   onRequestNotifications: () => void;
 }) {
-  const [key, setKey] = useState("");
-  const [saved, setSaved] = useState(false);
-
-  useEffect(() => {
-    if (open) {
-      setKey(getApiKey() ?? "");
-      setSaved(false);
-    }
-  }, [open]);
-
-  const save = () => {
-    setApiKey(key.trim());
-    setSaved(true);
-    setTimeout(() => onClose(), 600);
-  };
-
   const permission =
     typeof window !== "undefined" && "Notification" in window ? Notification.permission : "default";
 
@@ -2327,36 +2778,16 @@ function SettingsModal({
           />
           <DialogHeader>
             <div className="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-rasa-gold">
-              <KeyRound className="size-3" /> Settings
+              <Settings className="size-3" /> Settings
             </div>
-            <DialogTitle className="text-2xl font-bold mt-2">Connect Gemini</DialogTitle>
+            <DialogTitle className="text-2xl font-bold mt-2">Workspace settings</DialogTitle>
             <DialogDescription className="text-muted-foreground">
-              Paste your Google Gemini API key. Stored locally in your browser only.
+              Gemini runs from the backend. Add GEMINI_API_KEY to the server environment.
             </DialogDescription>
           </DialogHeader>
         </div>
 
         <div className="p-6 space-y-4">
-          <input
-            type="password"
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
-            placeholder="AIza..."
-            className="w-full rounded-xl bg-white/[0.03] border border-white/10 focus:border-rasa-gold/60 focus:ring-2 focus:ring-rasa-gold/20 outline-none px-4 py-3 text-sm font-mono transition"
-          />
-          <p className="text-[11px] text-muted-foreground">
-            Get one from{" "}
-            <a
-              href="https://aistudio.google.com/apikey"
-              target="_blank"
-              rel="noreferrer"
-              className="text-rasa-gold underline underline-offset-2"
-            >
-              aistudio.google.com/apikey
-            </a>
-            .
-          </p>
-
           <div className="pt-2 border-t border-white/5">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -2386,20 +2817,7 @@ function SettingsModal({
             onClick={onClose}
             className="px-4 py-2.5 rounded-xl text-sm bg-white/5 hover:bg-white/10 transition"
           >
-            Cancel
-          </button>
-          <button
-            onClick={save}
-            disabled={!key.trim()}
-            className="px-5 py-2.5 rounded-xl text-sm font-semibold bg-[image:var(--gradient-gold)] text-black hover:opacity-90 transition inline-flex items-center gap-2 disabled:opacity-50"
-          >
-            {saved ? (
-              <>
-                <CheckCircle2 className="size-4" /> Saved
-              </>
-            ) : (
-              <>Save key</>
-            )}
+            Close
           </button>
         </div>
       </DialogContent>
