@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { loginUser, registerUser } from "@/lib/auth";
+import { loginUser, registerUser, resetPassword } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -33,7 +33,7 @@ export const Route = createFileRoute("/login")({
 
 function LoginPage() {
   const navigate = useNavigate();
-  const [mode, setMode] = useState<"login" | "register">("login");
+  const [mode, setMode] = useState<"login" | "register" | "reset">("login");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -66,12 +66,12 @@ function LoginPage() {
       return;
     }
 
-    if (mode === "register" && password.length < 6) {
+    if ((mode === "register" || mode === "reset") && password.length < 6) {
       setError("Use at least 6 characters for your password.");
       return;
     }
 
-    if (mode === "register" && password !== confirmPassword) {
+    if ((mode === "register" || mode === "reset") && password !== confirmPassword) {
       setError("Passwords do not match.");
       return;
     }
@@ -82,6 +82,15 @@ function LoginPage() {
         await registerUser({ name, email, password });
         toast.success("Account created", {
           description: "Your private workspace is ready.",
+        });
+        void navigate({ to: "/" });
+        return;
+      }
+
+      if (mode === "reset") {
+        await resetPassword(email, password);
+        toast.success("Password reset", {
+          description: "You are signed in with your new password.",
         });
         void navigate({ to: "/" });
         return;
@@ -167,12 +176,18 @@ function LoginPage() {
                 </div>
                 <div>
                   <h1 className="text-2xl font-bold tracking-normal">
-                    {mode === "login" ? "Welcome back" : "Create account"}
+                    {mode === "login"
+                      ? "Welcome back"
+                      : mode === "reset"
+                        ? "Reset password"
+                        : "Create account"}
                   </h1>
                   <p className="mt-1 text-sm text-muted-foreground">
                     {mode === "login"
                       ? "Login with your registered credentials."
-                      : "Register first, then use these credentials every time."}
+                      : mode === "reset"
+                        ? "Set a new password for your registered email."
+                        : "Register first, then use these credentials every time."}
                   </p>
                 </div>
               </div>
@@ -212,12 +227,20 @@ function LoginPage() {
                 <div className="space-y-2">
                   <div className="flex items-center justify-between gap-3">
                     <Label htmlFor="password">Password</Label>
-                    <button
-                      type="button"
-                      className="text-xs text-rasa-gold transition hover:text-rasa-amber"
-                    >
-                      Forgot password?
-                    </button>
+                    {mode === "login" && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMode("reset");
+                          setError("");
+                          setPassword("");
+                          setConfirmPassword("");
+                        }}
+                        className="text-xs text-rasa-gold transition hover:text-rasa-amber"
+                      >
+                        Forgot password?
+                      </button>
+                    )}
                   </div>
                   <div className="relative">
                     <LockKeyhole className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -241,7 +264,7 @@ function LoginPage() {
                   </div>
                 </div>
 
-                {mode === "register" && (
+                {(mode === "register" || mode === "reset") && (
                   <div className="space-y-2">
                     <Label htmlFor="confirm-password">Confirm password</Label>
                     <div className="relative">
@@ -273,10 +296,14 @@ function LoginPage() {
                   {submitting
                     ? mode === "login"
                       ? "Signing in..."
-                      : "Creating account..."
+                      : mode === "reset"
+                        ? "Resetting..."
+                        : "Creating account..."
                     : mode === "login"
                       ? "Sign in"
-                      : "Register"}
+                      : mode === "reset"
+                        ? "Reset password"
+                        : "Register"}
                   <ArrowRight className="size-4" />
                 </Button>
               </form>

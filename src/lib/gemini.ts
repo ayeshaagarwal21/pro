@@ -26,6 +26,56 @@ function is503(err: unknown): boolean {
   return /UNAVAILABLE|overloaded|high demand/i.test(msg);
 }
 
+function parseTimeHint(text: string): string | undefined {
+  const amPm = /\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b/i.exec(text);
+  if (amPm) {
+    let hour = Number(amPm[1]);
+    const minute = Number(amPm[2] ?? "0");
+    const meridian = amPm[3].toLowerCase();
+    if (meridian.startsWith("p") && hour < 12) hour += 12;
+    if (meridian.startsWith("a") && hour === 12) hour = 0;
+    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  }
+
+  const clock = /\b(?:at\s*)?([01]?\d|2[0-3]):([0-5]\d)\b/i.exec(text);
+  return clock ? `${String(Number(clock[1])).padStart(2, "0")}:${clock[2]}` : undefined;
+}
+
+function localPrioritizeBrainDump(brainDump: string): AITask[] {
+  const parts = brainDump
+    .split(
+      /\n|;|,(?=\s*(?:and\s+)?(?:call|email|finish|submit|pay|schedule|meet|write|draft|review|send|book|buy|prepare|complete|update|create|fix|open|connect)\b)/i,
+    )
+    .map((part) => part.replace(/^\s*(?:and|then|also|plus)\s+/i, "").trim())
+    .filter(Boolean);
+
+  const chunks = parts.length ? parts : [brainDump.trim()];
+  return chunks
+    .map((chunk, index) => {
+      const lower = chunk.toLowerCase();
+      const urgent =
+        /\btoday|tonight|now|urgent|asap|deadline|due|tomorrow|meeting|submit|pay\b/.test(lower);
+      const light = /\bcall|email|message|pay|book|send\b/.test(lower);
+      const long = /\bproject|report|deck|presentation|research|build|prepare|review\b/.test(
+        lower,
+      );
+      const estimatedMinutes = light ? 15 : long ? 60 : 30;
+      const energyLevel = long ? "High" : light ? "Low" : "Medium";
+      const cleaned = chunk.replace(/\s+/g, " ").replace(/[.?!]+$/g, "").trim();
+      const title = cleaned
+        ? cleaned[0].toUpperCase() + cleaned.slice(1)
+        : `Task ${index + 1}`;
+      return {
+        title,
+        urgencyScore: Math.max(1, Math.min(10, urgent ? 9 - index : 6 - index)),
+        estimatedMinutes,
+        energyLevel: energyLevel as AITask["energyLevel"],
+        scheduledTime: parseTimeHint(chunk),
+      };
+    })
+    .sort((a, b) => b.urgencyScore - a.urgencyScore);
+}
+
 function parseLooseJson<T = unknown>(raw: string): T {
   const trimmed = raw
     .trim()
@@ -103,6 +153,13 @@ export async function prioritizeBrainDump(brainDump: string): Promise<AITask[]> 
   try {
     return await callGeminiTasks(brainDump);
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/not configured|GEMINI_API_KEY|Gemini request failed/i.test(msg)) {
+      toast("Using local prioritization", {
+        description: "Gemini is not configured, so Priora parsed this on-device.",
+      });
+      return localPrioritizeBrainDump(brainDump);
+    }
     if (!is503(err)) throw err;
     toast("Priora is experiencing high cognitive load. Retrying...", {
       description: "Gemini is overloaded — trying once more in 2 seconds.",
@@ -118,6 +175,66 @@ export async function prioritizeBrainDump(brainDump: string): Promise<AITask[]> 
 }
 
 /* ---------------- Auto-Execute ---------------- */
+
+function localAutoExecuteTask(taskTitle: string): string {
+  const title = taskTitle.trim();
+  const lower = title.toLowerCase();
+  if (/\b(email|mail|message|write to|reply)\b/.test(lower)) {
+    const recipientMatch = /\b(?:to|for)\s+([^,.;]+?)(?:\s+about|\s+regarding|\s+that|\s+at|$)/i.exec(
+      title,
+    );
+    const subject = title
+      .replace(/\b(write|draft|send)?\s*(an?\s*)?(email|mail|message)\s*(to)?\b/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const recipient = recipientMatch?.[1]?.trim() || "there";
+    return `## ${title}
+
+**Subject:** ${subject || title}
+
+Hi ${recipient},
+
+I wanted to let you know about ${subject || "the update we discussed"}.
+
+Here is the current plan:
+
+1. I will handle the immediate next step today.
+2. I will keep the timing practical and avoid creating extra confusion.
+3. I will follow up if anything changes or needs your confirmation.
+
+Please let me know if you want me to adjust anything.
+
+Best,`;
+  }
+
+  if (/\b(post|caption|linkedin|instagram|announcement)\b/.test(lower)) {
+    return `## ${title}
+
+Here is a ready-to-post draft:
+
+${title}
+
+Quick update: I am moving this forward with a clear plan, a tighter timeline, and the next action already blocked.
+
+What changes now:
+
+1. The priority is clear.
+2. The next step is scheduled.
+3. Follow-up will happen after the first focused block.
+
+More soon.`;
+  }
+
+  return `## ${title}
+
+Here is a ready-to-use execution plan:
+
+1. Define the outcome: what must be true when "${title}" is done.
+2. Gather the inputs: notes, links, contacts, files, and deadline.
+3. Start with the smallest irreversible action.
+4. Block one focused work session and finish the core draft.
+5. Review, send or submit, then log the follow-up.`;
+}
 
 export async function autoExecuteTask(taskTitle: string): Promise<string> {
   const prompt = `Act as an expert assistant and instantly complete this task. Provide a structured outline, draft, or logic flow so the user can just copy-paste and be done.
@@ -141,7 +258,7 @@ Respond in clean Markdown with:
         /* fall through */
       }
     }
-    return `## ${taskTitle}\n\n_Priora couldn't reach Gemini right now, so here's a fallback template:_\n\n1. Clarify the desired outcome in one sentence.\n2. Gather the 2–3 inputs you need before starting.\n3. Draft the first version in a single 25-minute focus block.\n4. Review, polish tone, and send / publish.\n5. Log completion in Priora and capture any follow-ups.`;
+    return localAutoExecuteTask(taskTitle);
   }
 }
 

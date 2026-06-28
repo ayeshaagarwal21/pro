@@ -39,6 +39,16 @@ export async function loginUser(email: string, password: string): Promise<Priora
   return readJson<PrioraUser>(response);
 }
 
+export async function resetPassword(email: string, password: string): Promise<PrioraUser> {
+  const response = await fetch("/api/auth/reset-password", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ email, password }),
+  });
+  return readJson<PrioraUser>(response);
+}
+
 export async function getCurrentUser(): Promise<PrioraUser | null> {
   const response = await fetch("/api/auth/me", {
     credentials: "include",

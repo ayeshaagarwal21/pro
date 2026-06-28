@@ -35,6 +35,11 @@ type Env = {
   DB?: D1Database;
 };
 
+type LocalStore = {
+  users: Map<string, DbUser>;
+  tasks: Map<string, DbTask>;
+};
+
 type DbUser = {
   id: string;
   name: string;
@@ -68,6 +73,7 @@ type DbTask = {
 const SESSION_COOKIE = "priora_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 let schemaReady = false;
+let warnedAboutLocalDb = false;
 
 function asEnv(env: unknown): Env {
   if (env && typeof env === "object") return env as Env;
@@ -87,7 +93,225 @@ function json(data: unknown, init?: ResponseInit): Response {
 
 function getDb(env: unknown): D1Database | null {
   const bindings = asEnv(env);
-  return bindings.PRIORA_DB ?? bindings.priora_db ?? bindings.DB ?? null;
+  return bindings.PRIORA_DB ?? bindings.priora_db ?? bindings.DB ?? getLocalDb();
+}
+
+function hasConfiguredDb(env: unknown): boolean {
+  const bindings = asEnv(env);
+  return !!(bindings.PRIORA_DB ?? bindings.priora_db ?? bindings.DB);
+}
+
+function displayNameFromEmail(email: string): string {
+  const local = email.split("@")[0] || "Priora User";
+  return local
+    .replace(/[._-]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+    .trim();
+}
+
+function getLocalStore(): LocalStore {
+  const global = globalThis as { __prioraLocalStore?: LocalStore };
+  if (!global.__prioraLocalStore) {
+    global.__prioraLocalStore = {
+      users: new Map(),
+      tasks: new Map(),
+    };
+  }
+  return global.__prioraLocalStore;
+}
+
+function getLocalDb(): D1Database {
+  if (!warnedAboutLocalDb) {
+    console.warn("Cloudflare D1 binding not found. Using Priora's local in-memory database.");
+    warnedAboutLocalDb = true;
+  }
+
+  return {
+    prepare: (query) => createLocalStatement(query, []),
+    exec: async () => ({ success: true }),
+  };
+}
+
+function createLocalStatement(query: string, values: unknown[]): D1PreparedStatement {
+  return {
+    bind: (...nextValues) => createLocalStatement(query, nextValues),
+    first: async <T = unknown>(column?: string) => {
+      const rows = await runLocalSelect<T>(query, values);
+      const first = rows[0] ?? null;
+      if (first && column) return (first as Record<string, unknown>)[column] as T;
+      return first;
+    },
+    all: async <T = unknown>() => ({ success: true, results: await runLocalSelect<T>(query, values) }),
+    run: async () => {
+      runLocalMutation(query, values);
+      return { success: true };
+    },
+  };
+}
+
+function normalizedQuery(query: string): string {
+  return query.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+async function runLocalSelect<T>(query: string, values: unknown[]): Promise<T[]> {
+  const store = getLocalStore();
+  const sql = normalizedQuery(query);
+
+  if (sql === "select id from users where email = ?") {
+    const email = String(values[0]);
+    const user = [...store.users.values()].find((row) => row.email === email);
+    return (user ? [{ id: user.id }] : []) as T[];
+  }
+
+  if (sql === "select * from users where email = ?") {
+    const email = String(values[0]);
+    const user = [...store.users.values()].find((row) => row.email === email);
+    return (user ? [user] : []) as T[];
+  }
+
+  if (sql === "select * from users where id = ?") {
+    const user = store.users.get(String(values[0]));
+    return (user ? [user] : []) as T[];
+  }
+
+  if (sql === "select * from tasks where user_id = ? order by created_at asc") {
+    const userId = String(values[0]);
+    return [...store.tasks.values()]
+      .filter((row) => row.user_id === userId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at)) as T[];
+  }
+
+  if (sql === "select * from tasks where id = ? and user_id = ?") {
+    const task = store.tasks.get(String(values[0]));
+    return (task && task.user_id === String(values[1]) ? [task] : []) as T[];
+  }
+
+  return [];
+}
+
+function runLocalMutation(query: string, values: unknown[]): void {
+  const store = getLocalStore();
+  const sql = normalizedQuery(query);
+  if (sql.startsWith("create table") || sql.startsWith("create index")) return;
+
+  if (sql.startsWith("insert into users")) {
+    const [id, name, email, passwordHash, createdAt] = values.map(String);
+    store.users.set(id, {
+      id,
+      name,
+      email,
+      password_hash: passwordHash,
+      created_at: createdAt,
+    });
+    return;
+  }
+
+  if (sql.startsWith("insert into tasks")) {
+    const [
+      id,
+      userId,
+      title,
+      description,
+      status,
+      priority,
+      dueDate,
+      score,
+      minutes,
+      energy,
+      due,
+      accent,
+      executableJson,
+      iconKey,
+      scheduledAt,
+      notified10,
+      createdAt,
+      updatedAt,
+      completedAt,
+    ] = values;
+    store.tasks.set(String(id), {
+      id: String(id),
+      user_id: String(userId),
+      title: String(title),
+      description: String(description),
+      status: taskStatus(status),
+      priority: Number(priority),
+      due_date: dueDate === null ? null : String(dueDate),
+      score: Number(score),
+      minutes: Number(minutes),
+      energy: taskEnergy(energy),
+      due: String(due),
+      accent: taskAccent(accent),
+      executable_json: executableJson === null ? null : String(executableJson),
+      icon_key: taskIcon(iconKey),
+      scheduled_at: String(scheduledAt),
+      notified10: Number(notified10),
+      created_at: String(createdAt),
+      updated_at: String(updatedAt),
+      completed_at: completedAt === null ? null : String(completedAt),
+    });
+    return;
+  }
+
+  if (sql.startsWith("update tasks set")) {
+    const taskId = String(values[16]);
+    const userId = String(values[17]);
+    const existing = store.tasks.get(taskId);
+    if (!existing || existing.user_id !== userId) return;
+
+    const [
+      title,
+      description,
+      status,
+      priority,
+      dueDate,
+      score,
+      minutes,
+      energy,
+      due,
+      accent,
+      executableJson,
+      iconKey,
+      scheduledAt,
+      notified10,
+      updatedAt,
+      completedAt,
+    ] = values;
+    store.tasks.set(taskId, {
+      ...existing,
+      title: String(title),
+      description: String(description),
+      status: taskStatus(status),
+      priority: Number(priority),
+      due_date: dueDate === null ? null : String(dueDate),
+      score: Number(score),
+      minutes: Number(minutes),
+      energy: taskEnergy(energy),
+      due: String(due),
+      accent: taskAccent(accent),
+      executable_json: executableJson === null ? null : String(executableJson),
+      icon_key: taskIcon(iconKey),
+      scheduled_at: String(scheduledAt),
+      notified10: Number(notified10),
+      updated_at: String(updatedAt),
+      completed_at: completedAt === null ? null : String(completedAt),
+    });
+    return;
+  }
+
+  if (sql === "update users set password_hash = ? where email = ?") {
+    const passwordHash = String(values[0]);
+    const email = String(values[1]);
+    const user = [...store.users.values()].find((row) => row.email === email);
+    if (user) {
+      store.users.set(user.id, { ...user, password_hash: passwordHash });
+    }
+    return;
+  }
+
+  if (sql === "delete from tasks where id = ? and user_id = ?") {
+    const task = store.tasks.get(String(values[0]));
+    if (task?.user_id === String(values[1])) store.tasks.delete(String(values[0]));
+  }
 }
 
 async function ensureSchema(db: D1Database): Promise<void> {
@@ -362,12 +586,104 @@ async function handleAuthApi(request: Request, env: unknown, pathname: string): 
       .prepare("SELECT * FROM users WHERE email = ?")
       .bind(email)
       .first<DbUser>();
-    if (!user || !(await verifyPassword(password, user.password_hash))) {
+    const usingLocalRecovery = !hasConfiguredDb(env);
+    if (!user && usingLocalRecovery) {
+      const now = new Date().toISOString();
+      const recoveredUser: DbUser = {
+        id: crypto.randomUUID(),
+        name: displayNameFromEmail(email),
+        email,
+        password_hash: await hashPassword(password),
+        created_at: now,
+      };
+      await db
+        .prepare(
+          "INSERT INTO users (id, name, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(
+          recoveredUser.id,
+          recoveredUser.name,
+          recoveredUser.email,
+          recoveredUser.password_hash,
+          recoveredUser.created_at,
+        )
+        .run();
+      const token = await createSession(recoveredUser.id, env);
+      return json(publicUser(recoveredUser), {
+        status: 201,
+        headers: { "set-cookie": sessionCookie(request, token) },
+      });
+    }
+    if (!user) {
       return json({ error: "Email or password is incorrect." }, { status: 401 });
     }
+    const passwordOk = await verifyPassword(password, user.password_hash);
+    if (!passwordOk && usingLocalRecovery) {
+      const passwordHash = await hashPassword(password);
+      await db
+        .prepare("UPDATE users SET password_hash = ? WHERE email = ?")
+        .bind(passwordHash, email)
+        .run();
+      const token = await createSession(user.id, env);
+      return json(publicUser({ ...user, password_hash: passwordHash }), {
+        headers: { "set-cookie": sessionCookie(request, token) },
+      });
+    }
+    if (!passwordOk) return json({ error: "Email or password is incorrect." }, { status: 401 });
 
     const token = await createSession(user.id, env);
     return json(publicUser(user), { headers: { "set-cookie": sessionCookie(request, token) } });
+  }
+
+  if (pathname === "/api/auth/reset-password" && request.method === "POST") {
+    const body = (await request.json().catch(() => null)) as {
+      email?: string;
+      password?: string;
+    } | null;
+    const email = body?.email?.trim().toLowerCase();
+    const password = body?.password ?? "";
+    if (!email || !/^\S+@\S+\.\S+$/.test(email) || password.length < 6) {
+      return json({ error: "Enter your registered email and a 6+ character password." }, { status: 400 });
+    }
+
+    const user = await db.prepare("SELECT * FROM users WHERE email = ?").bind(email).first<DbUser>();
+    if (!user) {
+      if (hasConfiguredDb(env)) {
+        return json({ error: "No account exists for this email." }, { status: 404 });
+      }
+      const now = new Date().toISOString();
+      const recoveredUser: DbUser = {
+        id: crypto.randomUUID(),
+        name: displayNameFromEmail(email),
+        email,
+        password_hash: await hashPassword(password),
+        created_at: now,
+      };
+      await db
+        .prepare(
+          "INSERT INTO users (id, name, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(
+          recoveredUser.id,
+          recoveredUser.name,
+          recoveredUser.email,
+          recoveredUser.password_hash,
+          recoveredUser.created_at,
+        )
+        .run();
+      const token = await createSession(recoveredUser.id, env);
+      return json(publicUser(recoveredUser), {
+        status: 201,
+        headers: { "set-cookie": sessionCookie(request, token) },
+      });
+    }
+
+    const passwordHash = await hashPassword(password);
+    await db.prepare("UPDATE users SET password_hash = ? WHERE email = ?").bind(passwordHash, email).run();
+    const token = await createSession(user.id, env);
+    return json(publicUser({ ...user, password_hash: passwordHash }), {
+      headers: { "set-cookie": sessionCookie(request, token) },
+    });
   }
 
   if (pathname === "/api/auth/me" && request.method === "GET") {

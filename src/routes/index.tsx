@@ -32,6 +32,13 @@ import {
   Download,
   RefreshCw,
   LogIn,
+  User,
+  Phone,
+  Link2,
+  Shield,
+  Palette,
+  Monitor,
+  Save,
 } from "lucide-react";
 
 import {
@@ -113,6 +120,67 @@ type AvailabilityBlock = {
   start: string;
   end: string;
 };
+
+type UserProfile = {
+  name: string;
+  email: string;
+  phone: string;
+  googleCalendarConnected: boolean;
+  calendarEmail: string;
+};
+
+type AppSettings = {
+  theme: "System" | "Dark" | "Light";
+  defaultFocusMinutes: number;
+  dayStart: string;
+  dayEnd: string;
+  unavailableBlocks: AvailabilityBlock[];
+  compactMode: boolean;
+  autoExportCalendar: boolean;
+  privacyMode: boolean;
+};
+
+type SearchResult = {
+  kind: "task" | "view" | "settings" | "profile" | "notification";
+  title: string;
+  description: string;
+  view?: "Dashboard" | "Priorities" | "Timeline" | "Insights";
+  taskId?: string;
+};
+
+const DEFAULT_SETTINGS: AppSettings = {
+  theme: "System",
+  defaultFocusMinutes: 30,
+  dayStart: "09:00",
+  dayEnd: "21:00",
+  unavailableBlocks: [],
+  compactMode: false,
+  autoExportCalendar: false,
+  privacyMode: false,
+};
+
+function profileStorageKey(userId: string): string {
+  return `priora-profile-${userId}`;
+}
+
+function settingsStorageKey(userId: string): string {
+  return `priora-settings-${userId}`;
+}
+
+function readStoredJson<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? ({ ...fallback, ...JSON.parse(raw) } as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredJson<T>(key: string, value: T): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(key, JSON.stringify(value));
+}
 
 /* Removed the old demo seed tasks so every account starts from saved user data.
   {
@@ -441,19 +509,37 @@ function aiTaskToTask(t: AITask, i: number, sourceText?: string): TaskDraft {
   };
 }
 
-function withSchedule(raw: TaskDraft[], startFrom: Date, occupied: Date[] = []): Task[] {
+function withSchedule(
+  raw: TaskDraft[],
+  startFrom: Date,
+  occupied: Date[] = [],
+  unavailable: AvailabilityBlock[] = [],
+): Task[] {
   const explicit = new Map<string, Date>();
   const flexible: TaskDraft[] = [];
+  const occupiedDates = [...occupied];
 
   for (const t of raw) {
     if (t.preferredTime) {
-      explicit.set(t.id, dateForPreferredTime(t.preferredTime, startFrom, t.minutes));
+      const preferred = dateForPreferredTime(t.preferredTime, startFrom, t.minutes);
+      const next =
+        overlapsUnavailable(preferred, t.minutes, unavailable) ||
+        overlapsOccupied(preferred, t.minutes, occupiedDates)
+          ? findNextAvailableSlot(preferred, t.minutes, occupiedDates, unavailable)
+          : preferred;
+      explicit.set(t.id, next);
+      occupiedDates.push(next);
     } else {
       flexible.push(t);
     }
   }
 
-  const scheduled = autoSchedule(flexible, startFrom, [...occupied, ...explicit.values()]);
+  const scheduled = new Map<string, Date>();
+  for (const task of [...flexible].sort((a, b) => b.score - a.score)) {
+    const next = findNextAvailableSlot(startFrom, task.minutes, occupiedDates, unavailable);
+    scheduled.set(task.id, next);
+    occupiedDates.push(next);
+  }
   return raw.map(({ preferredTime, ...t }) => ({
     ...t,
     scheduledAt: explicit.get(t.id) ?? scheduled.get(t.id) ?? startFrom,
@@ -735,6 +821,8 @@ function Index() {
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [brainOpen, setBrainOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const [completingId, setCompletingId] = useState<string | null>(null);
   const [now, setNow] = useState(new Date());
@@ -765,7 +853,21 @@ function Index() {
   const [tasksLoaded, setTasksLoaded] = useState(false);
   const [aiPowered, setAiPowered] = useState(false);
   const [currentUser, setCurrentUser] = useState<PrioraUser | null>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const reminderInFlightRef = useRef<Set<string>>(new Set());
+
+  const addNotification = useCallback((title: string, body: string) => {
+    setNotifications((prev) => [
+      {
+        id: `notification-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        title,
+        body,
+        unread: true,
+      },
+      ...prev,
+    ]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -780,6 +882,16 @@ function Index() {
           return;
         }
         setCurrentUser(user);
+        setProfile(
+          readStoredJson<UserProfile>(profileStorageKey(user.id), {
+            name: user.name,
+            email: user.email,
+            phone: "",
+            googleCalendarConnected: false,
+            calendarEmail: user.email,
+          }),
+        );
+        setSettings(readStoredJson<AppSettings>(settingsStorageKey(user.id), DEFAULT_SETTINGS));
         const records = await listTasks();
         if (cancelled) return;
         const savedTasks = records.map(fromStoredTask);
@@ -802,7 +914,7 @@ function Index() {
     };
   }, [navigate]);
 
-  const displayName = currentUser?.name || "User";
+  const displayName = profile?.name || currentUser?.name || "User";
   const firstName = displayName.split(" ")[0] || "User";
   const initials =
     displayName
@@ -986,10 +1098,21 @@ function Index() {
       raw,
       now,
       tasks.filter((task) => !task.completed).map((task) => task.scheduledAt),
+      settings.unavailableBlocks,
     );
     try {
       const saved = await createTasks(scheduled.map(toCreateTask));
-      setTasks((prev) => [...prev, ...saved.map(fromStoredTask)]);
+      const savedTasks = saved.map(fromStoredTask);
+      setTasks((prev) => [...prev, ...savedTasks]);
+      for (const task of savedTasks) {
+        addNotification(
+          "Scheduled reminder",
+          `${task.title} is set for ${task.scheduledAt.toLocaleTimeString(undefined, {
+            hour: "2-digit",
+            minute: "2-digit",
+          })}.`,
+        );
+      }
     } catch (error) {
       toast.error("Couldn't save tasks", {
         description: error instanceof Error ? error.message : "Database write failed.",
@@ -1002,6 +1125,10 @@ function Index() {
     toast.success("Priora prioritized your day", {
       description: `${raw.length} new ${raw.length === 1 ? "task" : "tasks"} saved to your database.`,
     });
+    addNotification(
+      "Tasks scheduled",
+      `${raw.length} ${raw.length === 1 ? "task was" : "tasks were"} added outside your blocked times.`,
+    );
   };
 
   const handleSelectSlot = (taskId?: string) => {
@@ -1027,6 +1154,7 @@ function Index() {
           toast.success("Task completed! +10 XP", {
             description: "Nice momentum - Priora updated your streak.",
           });
+          addNotification("Task completed", `${saved.title} was marked done. +10 XP added.`);
         })
         .catch((error) => {
           toast.error("Couldn't mark task complete", {
@@ -1035,7 +1163,7 @@ function Index() {
         })
         .finally(() => setCompletingId(null));
     }, 450);
-  }, []);
+  }, [addNotification]);
 
   const handleReschedule = useCallback(
     async (id: string, unavailable: AvailabilityBlock[] = []) => {
@@ -1044,9 +1172,10 @@ function Index() {
       toast("Asking Gemini for the next open slot…", { description: t.title });
       const occupiedTasks = activeTasks.filter((x) => x.id !== id);
       const occupiedDates = occupiedTasks.map((x) => x.scheduledAt);
+      const blockedTimes = [...settings.unavailableBlocks, ...unavailable];
       const occupied = [
         ...occupiedTasks.map((x) => fmt(x.scheduledAt)),
-        ...unavailable.map(formatBlock),
+        ...blockedTimes.map(formatBlock),
       ];
 
       let newDate: Date | null = null;
@@ -1062,10 +1191,10 @@ function Index() {
       }
       if (
         !newDate ||
-        overlapsUnavailable(newDate, t.minutes, unavailable) ||
+        overlapsUnavailable(newDate, t.minutes, blockedTimes) ||
         overlapsOccupied(newDate, t.minutes, occupiedDates)
       ) {
-        newDate = findNextAvailableSlot(new Date(), t.minutes, occupiedDates, unavailable);
+        newDate = findNextAvailableSlot(new Date(), t.minutes, occupiedDates, blockedTimes);
       }
       try {
         const saved = await updateTask(id, {
@@ -1083,8 +1212,16 @@ function Index() {
       toast.success("Rescheduled", {
         description: `${t.title} → ${newDate.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" })}`,
       });
+      addNotification(
+        "Task rescheduled",
+        `${t.title} moved to ${newDate.toLocaleString(undefined, {
+          weekday: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+        })}.`,
+      );
     },
-    [tasks, activeTasks],
+    [tasks, activeTasks, settings.unavailableBlocks, addNotification],
   );
 
   const handleAvailabilitySubmit = async (blocks: AvailabilityBlock[]) => {
@@ -1106,15 +1243,7 @@ function Index() {
   };
 
   const handleOpenNotifications = () => {
-    setNotifOpen((open) => {
-      const next = !open;
-      if (next) {
-        setNotifications((prev) =>
-          prev.map((notification) => ({ ...notification, unread: false })),
-        );
-      }
-      return next;
-    });
+    setNotifOpen((open) => !open);
   };
 
   const handleLogout = async () => {
@@ -1158,6 +1287,58 @@ function Index() {
     }
   };
 
+  const handleSaveProfile = (nextProfile: UserProfile) => {
+    if (!currentUser) return;
+    setProfile(nextProfile);
+    setCurrentUser((user) =>
+      user ? { ...user, name: nextProfile.name, email: nextProfile.email } : user,
+    );
+    writeStoredJson(profileStorageKey(currentUser.id), nextProfile);
+    toast.success("Profile updated", {
+      description: "Your contact and calendar preferences were saved.",
+    });
+  };
+
+  const handleSaveSettings = (nextSettings: AppSettings) => {
+    setSettings(nextSettings);
+    if (currentUser) writeStoredJson(settingsStorageKey(currentUser.id), nextSettings);
+    toast.success("Settings saved");
+    addNotification(
+      "Settings updated",
+      `${nextSettings.unavailableBlocks.length} blocked ${nextSettings.unavailableBlocks.length === 1 ? "time" : "times"} saved for AI scheduling.`,
+    );
+  };
+
+  const handleAiBarSubmit = async (value: string) => {
+    const prompt = value.trim();
+    if (!prompt) {
+      setBrainOpen(true);
+      return;
+    }
+    try {
+      const results = await prioritizeBrainDump(prompt);
+      await handlePrioritized(results, prompt);
+    } catch (error) {
+      toast.error("Priora could not parse that", {
+        description: error instanceof Error ? error.message : "Try a more specific request.",
+      });
+    }
+  };
+
+  const handleSearchSelect = (result: SearchResult) => {
+    setSearchOpen(false);
+    if (result.kind === "settings") {
+      setSettingsOpen(true);
+      return;
+    }
+    if (result.kind === "profile") {
+      setProfileOpen(true);
+      return;
+    }
+    if (result.view) setActiveView(result.view);
+    if (result.taskId) window.setTimeout(() => handleSelectSlot(result.taskId), 120);
+  };
+
   if (!tasksLoaded) {
     return (
       <div className="min-h-screen grid place-items-center text-foreground">
@@ -1197,7 +1378,7 @@ function Index() {
 
         <main className="flex-1 min-w-0 px-5 lg:px-10 pb-44 pt-6 lg:pt-10">
           {/* Header */}
-          <header className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 sm:flex sm:flex-wrap sm:justify-between mb-8">
+          <header className="grid grid-cols-1 gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start mb-8">
             <div className="min-w-0">
               <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
                 <span className="size-1.5 rounded-full bg-rasa-jade animate-pulse" />
@@ -1230,7 +1411,7 @@ function Index() {
                 .
               </p>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center justify-start gap-2 shrink-0 sm:justify-end">
               <div className="relative">
                 <button
                   onClick={handleOpenNotifications}
@@ -1249,7 +1430,7 @@ function Index() {
                     items={notifications}
                     onClose={() => setNotifOpen(false)}
                     onMarkAllRead={() => {
-                      setNotifications((p) => p.map((n) => ({ ...n, unread: false })));
+                      setNotifications([]);
                       setNotifOpen(false);
                     }}
                     onRequestPush={handleRequestNotifications}
@@ -1281,12 +1462,18 @@ function Index() {
                 </Link>
               )}
               <button
+                onClick={() => setSearchOpen(true)}
                 className="glass rounded-xl p-2.5 hover:bg-white/10 transition"
                 aria-label="Search"
               >
                 <Search className="size-4" />
               </button>
-              <div className="glass rounded-xl pl-1 pr-3 py-1 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setProfileOpen(true)}
+                className="glass rounded-xl pl-1 pr-3 py-1 flex items-center gap-2 hover:bg-white/10 transition text-left"
+                aria-label="Open profile"
+              >
                 <div className="size-8 rounded-lg bg-[image:var(--gradient-violet)] grid place-items-center text-sm font-bold">
                   {initials}
                 </div>
@@ -1294,7 +1481,7 @@ function Index() {
                   <div className="text-sm font-medium leading-none">{displayName}</div>
                   <div className="text-[10px] text-muted-foreground mt-0.5">Pro · Priora</div>
                 </div>
-              </div>
+              </button>
             </div>
           </header>
 
@@ -1378,7 +1565,7 @@ function Index() {
         </main>
       </div>
 
-      <AIBar onBrainDump={() => setBrainOpen(true)} />
+      <AIBar onBrainDump={() => setBrainOpen(true)} onSubmit={handleAiBarSubmit} />
       <SiteFooter activeView={activeView} onNav={setActiveView} />
       <ExecuteModal
         task={activeTask}
@@ -1402,6 +1589,30 @@ function Index() {
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         onRequestNotifications={handleRequestNotifications}
+        settings={settings}
+        onSave={handleSaveSettings}
+      />
+      <ProfileModal
+        open={profileOpen}
+        onClose={() => setProfileOpen(false)}
+        profile={
+          profile ?? {
+            name: currentUser?.name ?? "",
+            email: currentUser?.email ?? "",
+            phone: "",
+            googleCalendarConnected: false,
+            calendarEmail: currentUser?.email ?? "",
+          }
+        }
+        onSave={handleSaveProfile}
+      />
+      <SearchModal
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        tasks={tasks}
+        notifications={notifications}
+        profile={profile}
+        onSelect={handleSearchSelect}
       />
       <AvailabilityModal
         task={availabilityTask}
@@ -2254,7 +2465,7 @@ function NotificationsDropdown({
           </button>
         </div>
         <ul className="space-y-1.5 max-h-80 overflow-auto">
-          {items.map((n) => (
+          {items.length ? items.map((n) => (
             <li
               key={n.id}
               className="rounded-xl p-2.5 bg-white/[0.03] hover:bg-white/[0.06] transition"
@@ -2269,7 +2480,11 @@ function NotificationsDropdown({
                 </div>
               </div>
             </li>
-          ))}
+          )) : (
+            <li className="rounded-xl p-4 text-center text-xs text-muted-foreground bg-white/[0.03]">
+              No notifications.
+            </li>
+          )}
         </ul>
         <button
           onClick={onRequestPush}
@@ -2377,8 +2592,26 @@ function SiteFooter({
   );
 }
 
-function AIBar({ onBrainDump }: { onBrainDump: () => void }) {
+function AIBar({
+  onBrainDump,
+  onSubmit,
+}: {
+  onBrainDump: () => void;
+  onSubmit: (value: string) => Promise<void>;
+}) {
   const [value, setValue] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async () => {
+    if (submitting) return;
+    const next = value.trim();
+    setSubmitting(true);
+    try {
+      await onSubmit(next);
+      setValue("");
+    } finally {
+      setSubmitting(false);
+    }
+  };
   return (
     <div className="fixed bottom-4 inset-x-4 lg:left-[304px] lg:right-8 z-30">
       <div className="glass-strong rounded-2xl shadow-neon-violet px-3 py-2.5 flex items-center gap-2">
@@ -2388,6 +2621,12 @@ function AIBar({ onBrainDump }: { onBrainDump: () => void }) {
         <input
           value={value}
           onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              void submit();
+            }
+          }}
           placeholder="Ask Priora — “Reschedule my afternoon around the viva”…"
           className="flex-1 bg-transparent outline-none text-sm placeholder:text-muted-foreground"
         />
@@ -2405,10 +2644,12 @@ function AIBar({ onBrainDump }: { onBrainDump: () => void }) {
           <Mic className="size-4 text-rasa-rose" />
         </button>
         <button
-          className="size-9 grid place-items-center rounded-xl bg-[image:var(--gradient-violet)] hover:opacity-90 transition"
+          onClick={() => void submit()}
+          disabled={submitting}
+          className="size-9 grid place-items-center rounded-xl bg-[image:var(--gradient-violet)] hover:opacity-90 transition disabled:opacity-60"
           aria-label="Send"
         >
-          <Send className="size-4" />
+          {submitting ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
         </button>
       </div>
     </div>
@@ -2755,18 +2996,272 @@ function BrainDumpModal({
   );
 }
 
+/* ---------- Profile + Search Modals ---------- */
+function ProfileModal({
+  open,
+  onClose,
+  profile,
+  onSave,
+}: {
+  open: boolean;
+  onClose: () => void;
+  profile: UserProfile;
+  onSave: (profile: UserProfile) => void;
+}) {
+  const [draft, setDraft] = useState(profile);
+
+  useEffect(() => {
+    if (open) setDraft(profile);
+  }, [open, profile]);
+
+  const update = (patch: Partial<UserProfile>) => setDraft((current) => ({ ...current, ...patch }));
+
+  return (
+    <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
+      <DialogContent className="glass-strong border-white/10 sm:max-w-lg p-0 overflow-hidden">
+        <div className="relative p-6 pb-4 border-b border-white/5">
+          <DialogHeader>
+            <div className="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-rasa-violet">
+              <User className="size-3" /> Profile
+            </div>
+            <DialogTitle className="text-2xl font-bold mt-2">Your profile</DialogTitle>
+            <DialogDescription className="text-muted-foreground">
+              Keep your contact details and calendar identity ready for scheduling.
+            </DialogDescription>
+          </DialogHeader>
+        </div>
+
+        <div className="p-6 space-y-4">
+          <label className="space-y-2 text-sm font-medium block">
+            Full name
+            <input
+              value={draft.name}
+              onChange={(event) => update({ name: event.target.value })}
+              className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-sm outline-none focus:border-rasa-violet/60"
+            />
+          </label>
+          <label className="space-y-2 text-sm font-medium block">
+            Email address
+            <div className="relative">
+              <Mail className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <input
+                type="email"
+                value={draft.email}
+                onChange={(event) => update({ email: event.target.value })}
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-3 text-sm outline-none focus:border-rasa-violet/60"
+              />
+            </div>
+          </label>
+          <label className="space-y-2 text-sm font-medium block">
+            Phone number
+            <div className="relative">
+              <Phone className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <input
+                type="tel"
+                value={draft.phone}
+                onChange={(event) => update({ phone: event.target.value })}
+                placeholder="+91 98765 43210"
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2.5 pl-10 pr-3 text-sm outline-none focus:border-rasa-violet/60"
+              />
+            </div>
+          </label>
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold flex items-center gap-2">
+                  <CalendarPlus className="size-4 text-rasa-gold" /> Google Calendar
+                </div>
+                <div className="text-[11px] text-muted-foreground mt-0.5">
+                  Connect preference for calendar links and exported schedules.
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  update({ googleCalendarConnected: !draft.googleCalendarConnected })
+                }
+                className={`px-3 py-2 rounded-lg text-xs font-semibold transition ${
+                  draft.googleCalendarConnected
+                    ? "bg-rasa-jade/20 text-rasa-jade"
+                    : "bg-white/10 text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {draft.googleCalendarConnected ? "Connected" : "Connect"}
+              </button>
+            </div>
+            <input
+              type="email"
+              value={draft.calendarEmail}
+              onChange={(event) => update({ calendarEmail: event.target.value })}
+              placeholder="calendar@example.com"
+              className="mt-3 w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-rasa-gold/60"
+            />
+          </div>
+        </div>
+
+        <div className="p-5 border-t border-white/5 flex justify-end gap-2">
+          <button onClick={onClose} className="px-4 py-2.5 rounded-xl text-sm bg-white/5 hover:bg-white/10 transition">
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              onSave(draft);
+              onClose();
+            }}
+            className="px-5 py-2.5 rounded-xl text-sm font-semibold bg-[image:var(--gradient-violet)] hover:opacity-90 transition inline-flex items-center gap-2"
+          >
+            <Save className="size-4" /> Save profile
+          </button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function SearchModal({
+  open,
+  onClose,
+  tasks,
+  notifications,
+  profile,
+  onSelect,
+}: {
+  open: boolean;
+  onClose: () => void;
+  tasks: Task[];
+  notifications: { id: string; title: string; body: string; unread: boolean }[];
+  profile: UserProfile | null;
+  onSelect: (result: SearchResult) => void;
+}) {
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    if (open) setQuery("");
+  }, [open]);
+
+  const results = useMemo(() => {
+    const base: SearchResult[] = [
+      { kind: "view", title: "Dashboard", description: "Overview, focus task, and schedule", view: "Dashboard" },
+      { kind: "view", title: "Priorities", description: "All active priority tasks", view: "Priorities" },
+      { kind: "view", title: "Timeline", description: "Calendar-style schedule", view: "Timeline" },
+      { kind: "view", title: "Insights", description: "Weekly productivity stats", view: "Insights" },
+      { kind: "settings", title: "Settings", description: "Notifications, theme, schedule, privacy" },
+      { kind: "profile", title: "Profile", description: `${profile?.name ?? "User"} ${profile?.email ?? ""} ${profile?.phone ?? ""}` },
+      ...tasks.map((task) => ({
+        kind: "task" as const,
+        title: task.title,
+        description: `${task.context} ${task.due} ${task.energy} ${task.scheduledAt.toLocaleString()}`,
+        view: "Priorities" as const,
+        taskId: task.id,
+      })),
+      ...notifications.map((item) => ({
+        kind: "notification" as const,
+        title: item.title,
+        description: item.body,
+        view: "Dashboard" as const,
+      })),
+    ];
+    const needle = query.trim().toLowerCase();
+    if (!needle) return base.slice(0, 10);
+    return base
+      .filter((item) => `${item.title} ${item.description} ${item.kind}`.toLowerCase().includes(needle))
+      .slice(0, 20);
+  }, [notifications, profile, query, tasks]);
+
+  return (
+    <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}>
+      <DialogContent className="glass-strong border-white/10 sm:max-w-2xl p-0 overflow-hidden">
+        <div className="p-5 border-b border-white/5">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <input
+              autoFocus
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search tasks, settings, profile, calendar, notifications..."
+              className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-3 pl-10 pr-3 text-sm outline-none focus:border-rasa-violet/60"
+            />
+          </div>
+        </div>
+        <div className="max-h-[60vh] overflow-y-auto p-3">
+          {results.length ? (
+            <div className="space-y-1">
+              {results.map((result, index) => (
+                <button
+                  key={`${result.kind}-${result.title}-${index}`}
+                  onClick={() => onSelect(result)}
+                  className="w-full rounded-xl px-3 py-3 text-left hover:bg-white/[0.06] transition flex items-start gap-3"
+                >
+                  <div className="mt-0.5 size-8 rounded-lg bg-white/10 grid place-items-center text-rasa-violet">
+                    {result.kind === "settings" ? (
+                      <Settings className="size-4" />
+                    ) : result.kind === "profile" ? (
+                      <User className="size-4" />
+                    ) : result.kind === "task" ? (
+                      <Target className="size-4" />
+                    ) : (
+                      <Search className="size-4" />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold truncate">{result.title}</div>
+                    <div className="text-xs text-muted-foreground line-clamp-2">{result.description}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="px-4 py-10 text-center text-sm text-muted-foreground">
+              No matches found.
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 /* ---------- Settings Modal ---------- */
 function SettingsModal({
   open,
   onClose,
   onRequestNotifications,
+  settings,
+  onSave,
 }: {
   open: boolean;
   onClose: () => void;
   onRequestNotifications: () => void;
+  settings: AppSettings;
+  onSave: (settings: AppSettings) => void;
 }) {
+  const [draft, setDraft] = useState(settings);
+  const [blockStart, setBlockStart] = useState("13:00");
+  const [blockEnd, setBlockEnd] = useState("14:00");
   const permission =
     typeof window !== "undefined" && "Notification" in window ? Notification.permission : "default";
+
+  useEffect(() => {
+    if (open) setDraft(settings);
+  }, [open, settings]);
+
+  const update = (patch: Partial<AppSettings>) => setDraft((current) => ({ ...current, ...patch }));
+  const addBlockedTime = () => {
+    if (timeToMinutes(blockEnd) <= timeToMinutes(blockStart)) {
+      toast.error("Blocked time end must be after start.");
+      return;
+    }
+    const next = { start: blockStart, end: blockEnd };
+    setDraft((current) => ({
+      ...current,
+      unavailableBlocks: [...current.unavailableBlocks, next],
+    }));
+  };
+  const removeBlockedTime = (index: number) => {
+    setDraft((current) => ({
+      ...current,
+      unavailableBlocks: current.unavailableBlocks.filter((_, itemIndex) => itemIndex !== index),
+    }));
+  };
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
@@ -2782,12 +3277,113 @@ function SettingsModal({
             </div>
             <DialogTitle className="text-2xl font-bold mt-2">Workspace settings</DialogTitle>
             <DialogDescription className="text-muted-foreground">
-              Gemini runs from the backend. Add GEMINI_API_KEY to the server environment.
+              Tune Priora around your workday, notifications, calendar, and privacy preferences.
             </DialogDescription>
           </DialogHeader>
         </div>
 
-        <div className="p-6 space-y-4">
+        <div className="p-6 space-y-5 max-h-[65vh] overflow-y-auto">
+          <div className="grid grid-cols-3 gap-2">
+            {(["System", "Dark", "Light"] as AppSettings["theme"][]).map((theme) => (
+              <button
+                key={theme}
+                type="button"
+                onClick={() => update({ theme })}
+                className={`rounded-xl border px-3 py-2 text-xs font-semibold transition ${
+                  draft.theme === theme
+                    ? "border-rasa-violet/60 bg-rasa-violet/20 text-foreground"
+                    : "border-white/10 bg-white/[0.03] text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {theme === "System" && <Monitor className="mx-auto mb-1 size-4" />}
+                {theme === "Dark" && <Palette className="mx-auto mb-1 size-4" />}
+                {theme === "Light" && <Sparkles className="mx-auto mb-1 size-4" />}
+                {theme}
+              </button>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <label className="space-y-2 text-sm font-medium">
+              Focus minutes
+              <input
+                type="number"
+                min={5}
+                max={240}
+                value={draft.defaultFocusMinutes}
+                onChange={(event) => update({ defaultFocusMinutes: Number(event.target.value) })}
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-sm outline-none focus:border-rasa-violet/60"
+              />
+            </label>
+            <label className="space-y-2 text-sm font-medium">
+              Day starts
+              <input
+                type="time"
+                value={draft.dayStart}
+                onChange={(event) => update({ dayStart: event.target.value })}
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-sm outline-none focus:border-rasa-violet/60"
+              />
+            </label>
+            <label className="space-y-2 text-sm font-medium">
+              Day ends
+              <input
+                type="time"
+                value={draft.dayEnd}
+                onChange={(event) => update({ dayEnd: event.target.value })}
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2.5 text-sm outline-none focus:border-rasa-violet/60"
+              />
+            </label>
+          </div>
+
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+            <div className="text-sm font-semibold flex items-center gap-2">
+              <Clock className="size-3.5 text-rasa-gold" /> Do not schedule during
+            </div>
+            <div className="mt-3 grid grid-cols-[1fr_1fr_auto] gap-2">
+              <input
+                type="time"
+                value={blockStart}
+                onChange={(event) => setBlockStart(event.target.value)}
+                className="min-w-0 rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-rasa-gold/60"
+                aria-label="Blocked start time"
+              />
+              <input
+                type="time"
+                value={blockEnd}
+                onChange={(event) => setBlockEnd(event.target.value)}
+                className="min-w-0 rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus:border-rasa-gold/60"
+                aria-label="Blocked end time"
+              />
+              <button
+                type="button"
+                onClick={addBlockedTime}
+                className="rounded-xl bg-rasa-gold px-3 py-2 text-xs font-semibold text-black hover:opacity-90 transition"
+              >
+                Add
+              </button>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {draft.unavailableBlocks.length ? (
+                draft.unavailableBlocks.map((block, index) => (
+                  <button
+                    key={`${block.start}-${block.end}-${index}`}
+                    type="button"
+                    onClick={() => removeBlockedTime(index)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-rasa-gold/25 bg-rasa-gold/10 px-2.5 py-1.5 text-xs text-rasa-gold hover:bg-rasa-gold/20 transition"
+                    title="Remove blocked time"
+                  >
+                    {formatBlock(block)}
+                    <X className="size-3" />
+                  </button>
+                ))
+              ) : (
+                <span className="text-[11px] text-muted-foreground">
+                  No blocked times yet. AI scheduling can use the whole workday.
+                </span>
+              )}
+            </div>
+          </div>
+
           <div className="pt-2 border-t border-white/5">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -2810,6 +3406,50 @@ function SettingsModal({
               </button>
             </div>
           </div>
+
+          {[
+            {
+              key: "autoExportCalendar" as const,
+              icon: CalendarPlus,
+              title: "Calendar export reminders",
+              body: "Show calendar sync nudges after task changes.",
+            },
+            {
+              key: "compactMode" as const,
+              icon: LayoutDashboard,
+              title: "Compact dashboard",
+              body: "Prefer denser lists and smaller task cards.",
+            },
+            {
+              key: "privacyMode" as const,
+              icon: Shield,
+              title: "Privacy mode",
+              body: "Reduce sensitive details in previews and notifications.",
+            },
+          ].map((item) => (
+            <div key={item.key} className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+              <div>
+                <div className="text-sm font-semibold flex items-center gap-2">
+                  <item.icon className="size-3.5 text-rasa-jade" /> {item.title}
+                </div>
+                <div className="text-[11px] text-muted-foreground mt-0.5">{item.body}</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => update({ [item.key]: !draft[item.key] })}
+                className={`h-7 w-12 rounded-full p-1 transition ${
+                  draft[item.key] ? "bg-rasa-jade/80" : "bg-white/10"
+                }`}
+                aria-pressed={draft[item.key]}
+              >
+                <span
+                  className={`block size-5 rounded-full bg-white transition ${
+                    draft[item.key] ? "translate-x-5" : "translate-x-0"
+                  }`}
+                />
+              </button>
+            </div>
+          ))}
         </div>
 
         <div className="p-5 border-t border-white/5 flex justify-end gap-2">
@@ -2818,6 +3458,15 @@ function SettingsModal({
             className="px-4 py-2.5 rounded-xl text-sm bg-white/5 hover:bg-white/10 transition"
           >
             Close
+          </button>
+          <button
+            onClick={() => {
+              onSave(draft);
+              onClose();
+            }}
+            className="px-5 py-2.5 rounded-xl text-sm font-semibold bg-[image:var(--gradient-violet)] hover:opacity-90 transition inline-flex items-center gap-2"
+          >
+            <Save className="size-4" /> Save settings
           </button>
         </div>
       </DialogContent>
