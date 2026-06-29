@@ -114,38 +114,51 @@ async function generateWithFallback(
 }
 
 async function callGeminiTasks(brainDump: string): Promise<AITask[]> {
-  const prompt = `You are an intelligent productivity assistant. Parse this messy brain-dump of tasks and return a JSON array.
+  const prompt = `You are an intelligent productivity assistant. Your goal is to parse messy brain-dump text into a precise JSON array. For each task, extract:
 
-For each task, extract:
-- title: a clean, action-oriented task name (start with a verb)
-- urgencyScore: integer 1-10 (10 = most urgent)
-- estimatedMinutes: realistic time in minutes (5-240)
-- energyLevel: "High", "Medium", or "Low"
-- scheduledTime: if the user gave an exact time like "9pm", "21:00", or "at 6:30 AM", return it as HH:MM in 24-hour time. Otherwise return "".
+Title: Action-oriented (start with a verb).
+UrgencyScore: 1-10.
+EstimatedMinutes: 5-240.
+EnergyLevel: "High", "Medium", or "Low".
+ScheduledTime: HH:MM 24-hour format (or empty string).
+
+Output ONLY the raw JSON array. No markdown, no commentary.
 
 Brain-dump:
 """
 ${brainDump}
-"""
-
-Return ONLY a JSON array of objects with keys: title, urgencyScore, estimatedMinutes, energyLevel, scheduledTime. No commentary, no markdown fences.`;
+"""`;
 
   const text = await generateWithFallback(prompt, { json: true });
   const parsed = parseLooseJson<AITask[]>(text);
 
   return parsed
-    .filter((t) => t && t.title)
-    .map((t) => ({
-      title: String(t.title),
-      urgencyScore: Math.max(1, Math.min(10, Number(t.urgencyScore) || 5)),
-      estimatedMinutes: Math.max(1, Number(t.estimatedMinutes) || 15),
-      energyLevel: (["High", "Medium", "Low"].includes(t.energyLevel)
-        ? t.energyLevel
-        : "Medium") as AITask["energyLevel"],
-      scheduledTime: /^\d{2}:\d{2}$/.test(String(t.scheduledTime ?? ""))
-        ? String(t.scheduledTime)
-        : undefined,
-    }))
+    .filter((t) => t && (t.title || (t as { Title?: string }).Title))
+    .map((t) => {
+      const task = t as AITask & {
+        Title?: string;
+        UrgencyScore?: number;
+        EstimatedMinutes?: number;
+        EnergyLevel?: AITask["energyLevel"];
+        ScheduledTime?: string;
+      };
+      const title = task.title ?? task.Title;
+      const urgencyScore = task.urgencyScore ?? task.UrgencyScore;
+      const estimatedMinutes = task.estimatedMinutes ?? task.EstimatedMinutes;
+      const energyLevel = task.energyLevel ?? task.EnergyLevel;
+      const scheduledTime = task.scheduledTime ?? task.ScheduledTime;
+      return {
+        title: String(title),
+        urgencyScore: Math.max(1, Math.min(10, Number(urgencyScore) || 5)),
+        estimatedMinutes: Math.max(1, Number(estimatedMinutes) || 15),
+        energyLevel: (["High", "Medium", "Low"].includes(energyLevel)
+          ? energyLevel
+          : "Medium") as AITask["energyLevel"],
+        scheduledTime: /^\d{2}:\d{2}$/.test(String(scheduledTime ?? ""))
+          ? String(scheduledTime)
+          : undefined,
+      };
+    })
     .sort((a, b) => b.urgencyScore - a.urgencyScore);
 }
 
@@ -237,15 +250,16 @@ Here is a ready-to-use execution plan:
 }
 
 export async function autoExecuteTask(taskTitle: string): Promise<string> {
-  const prompt = `Act as an expert assistant and instantly complete this task. Provide a structured outline, draft, or logic flow so the user can just copy-paste and be done.
-
-Task: "${taskTitle}"
+  const prompt = `Act as an expert assistant and instantly complete tasks. Provide a structured outline, draft, or logic flow so the user can just copy-paste and be done.
 
 Respond in clean Markdown with:
-- A short heading
-- A ready-to-use draft (email body, post copy, code, or step-by-step plan as appropriate)
-- Bullet lists or numbered steps where helpful
-- Keep it under 350 words. No preamble, no apologies.`;
+A short heading.
+A ready-to-use draft (email, post, code, or plan).
+Bullet lists where helpful.
+
+Keep it under 350 words. No preamble, no apologies.
+
+Task: "${taskTitle}"`;
 
   try {
     return await generateWithFallback(prompt);
@@ -268,14 +282,13 @@ export async function suggestRescheduleSlot(
   taskTitle: string,
   occupiedSlots: string[],
 ): Promise<{ time: string; reason: string }> {
-  const prompt = `You are a scheduling assistant. The user missed this task: "${taskTitle}".
+  const prompt = `You are a scheduling assistant. The user missed a task.
+Given a list of occupied time slots (HH:MM 24h), find the next available 30-minute slot today between 09:00 and 21:00. If today is full, suggest tomorrow at 09:00.
 
-These time slots are already taken today (HH:MM 24h): ${occupiedSlots.join(", ") || "none"}.
+Respond ONLY with JSON: { "time": "HH:MM", "reason": "one-line rationale" }
 
-Find the next available 30-minute slot today between 09:00 and 21:00 that doesn't conflict.
-If today is full, suggest tomorrow at 09:00.
-
-Respond ONLY with JSON: { "time": "HH:MM", "reason": "one-line rationale" }`;
+Task: "${taskTitle}"
+Occupied Slots: ${occupiedSlots.join(", ") || "none"}`;
 
   try {
     const text = await generateWithFallback(prompt, { json: false });

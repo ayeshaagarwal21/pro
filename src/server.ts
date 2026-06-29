@@ -926,10 +926,11 @@ const taskSchema = {
 
 function readGeminiKey(env: unknown): string | null {
   if (env && typeof env === "object") {
-    const value = (env as Record<string, unknown>).GEMINI_API_KEY;
+    const vars = env as Record<string, unknown>;
+    const value = vars.GEMINI_API_KEY ?? vars.VITE_GEMINI_API_KEY;
     if (typeof value === "string" && value.trim()) return value.trim();
   }
-  const value = process.env.GEMINI_API_KEY;
+  const value = process.env.GEMINI_API_KEY ?? process.env.VITE_GEMINI_API_KEY;
   return value?.trim() || null;
 }
 
@@ -949,7 +950,10 @@ async function handleGeminiApi(request: Request, env: unknown): Promise<Response
   const key = readGeminiKey(env);
   if (!key) {
     return Response.json(
-      { error: "Gemini is not configured on the server. Add GEMINI_API_KEY in the backend." },
+      {
+        error:
+          "Gemini is not configured on the server. Add GEMINI_API_KEY or VITE_GEMINI_API_KEY in the backend.",
+      },
       { status: 503 },
     );
   }
